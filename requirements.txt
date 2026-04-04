@@ -1,0 +1,10 @@
+ttkbootstrap>=1.10
+cryptography>=44.0
+secretsharing>=0.2.6
+pyHanko>=0.26
+weasyprint>=65.0
+Jinja2>=3.1
+Flask>=3.1
+mariadb
+pytest
+pytest-cov

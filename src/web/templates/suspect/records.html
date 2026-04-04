@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}봉인 기록지 열람 - 피압수자{% endblock %}
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-10">
+        <h3 class="mb-4">봉인 기록지 열람</h3>
+        <p class="text-muted">봉인 ID: <strong>{{ seal_id }}</strong></p>
+
+        {% if records %}
+        <table class="table table-bordered table-hover">
+            <thead>
+                <tr>
+                    <th>이벤트 번호</th>
+                    <th>유형</th>
+                    <th>동기화 시각</th>
+                    <th>상세</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for rec in records %}
+                <tr>
+                    <td>{{ rec.event_id }}</td>
+                    <td>
+                        {% if rec.event_type == 'Sealing' %}
+                            <span class="badge bg-primary">봉인</span>
+                        {% elif rec.event_type == 'Unsealing' %}
+                            <span class="badge bg-warning text-dark">봉인해제</span>
+                        {% elif rec.event_type == 'Resealing' %}
+                            <span class="badge bg-success">재봉인</span>
+                        {% endif %}
+                    </td>
+                    <td>{{ rec.synced_at }}</td>
+                    <td>
+                        <button class="btn btn-sm btn-outline-secondary"
+                                onclick="showRecord({{ loop.index0 }})">
+                            기록지 보기
+                        </button>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        {% for rec in records %}
+        <div class="modal fade" id="recordModal{{ loop.index0 }}" tabindex="-1">
+            <div class="modal-dialog modal-lg">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title">
+                            봉인 기록 - 이벤트 {{ rec.event_id }} ({{ rec.event_type }})
+                        </h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <pre class="bg-light p-3" style="max-height:60vh;overflow:auto;">{{ rec.record_json }}</pre>
+                    </div>
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+        {% else %}
+        <div class="alert alert-info">
+            아직 동기화된 봉인 기록이 없습니다.
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+function showRecord(index) {
+    const modal = new bootstrap.Modal(document.getElementById('recordModal' + index));
+    modal.show();
+}
+</script>
+{% endblock %}

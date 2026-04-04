@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+{% block title %}본인 인증 - 피압수자{% endblock %}
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-8">
+        <h3 class="mb-4">본인 인증</h3>
+
+        {% if not seal_id or seal_id == '' %}
+        <form method="GET" action="">
+            <div class="mb-3">
+                <label for="seal_id_input" class="form-label required">봉인 ID</label>
+                <input type="text" class="form-control" id="seal_id_input"
+                       placeholder="S-20251104-ABA82E" required>
+            </div>
+            <button type="button" class="btn btn-primary" onclick="goToAuth()">인증 페이지로 이동</button>
+        </form>
+        <script>
+        function goToAuth() {
+            const sealId = document.getElementById('seal_id_input').value.trim();
+            if (sealId) {
+                window.location.href = '/suspect/auth/' + encodeURIComponent(sealId);
+            }
+        }
+        </script>
+        {% elif locked %}
+        <div class="lockout-banner">
+            <h5>인증 차단</h5>
+            <p>인증 실패 횟수 초과로 일시적으로 차단되었습니다.</p>
+            <p>잠시 후 다시 시도해 주세요.</p>
+        </div>
+        {% elif case %}
+        <p class="text-muted">봉인 ID: <strong>{{ seal_id }}</strong></p>
+
+        <form method="POST" action="{{ url_for('suspect.auth', seal_id=seal_id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+            <div class="card mb-3">
+                <div class="card-header">기본 인증 (필수)</div>
+                <div class="card-body">
+                    <div class="mb-3">
+                        <label for="name" class="form-label required">이름</label>
+                        <input type="text" class="form-control" id="name" name="name" required>
+                    </div>
+                    <div class="mb-3">
+                        <label for="birth_date" class="form-label required">생년월일</label>
+                        <input type="text" class="form-control" id="birth_date" name="birth_date"
+                               placeholder="1990-01-01" required>
+                    </div>
+                    <div class="mb-3">
+                        <label for="phone" class="form-label required">연락처</label>
+                        <input type="text" class="form-control" id="phone" name="phone"
+                               placeholder="010-1234-5678" required>
+                    </div>
+                </div>
+            </div>
+
+            {% if auth_level and 'password' in auth_level %}
+            <div class="card mb-3">
+                <div class="card-header">비밀번호 인증</div>
+                <div class="card-body">
+                    <div class="mb-3">
+                        <label for="password" class="form-label required">비밀번호</label>
+                        <input type="password" class="form-control" id="password" name="password" required>
+                    </div>
+                </div>
+            </div>
+            {% endif %}
+
+            {% if auth_level and 'otp' in auth_level %}
+            <div class="card mb-3">
+                <div class="card-header">이메일 OTP 인증</div>
+                <div class="card-body">
+                    <p class="text-muted">등록된 이메일로 인증번호를 발송합니다.</p>
+                    <div class="mb-3">
+                        <button type="button" class="btn btn-outline-info btn-sm"
+                                onclick="requestOTP()">인증번호 발송</button>
+                    </div>
+                    <div class="mb-3">
+                        <label for="otp" class="form-label required">인증번호 (6자리)</label>
+                        <input type="text" class="form-control" id="otp" name="otp"
+                               maxlength="6" pattern="[0-9]{6}" required>
+                        <div class="form-text">유효시간: 5분</div>
+                    </div>
+                </div>
+            </div>
+            {% endif %}
+
+            <button type="submit" class="btn btn-success">인증</button>
+        </form>
+        {% else %}
+        <div class="alert alert-danger">
+            해당 봉인 ID의 사건이 존재하지 않습니다.
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+function requestOTP() {
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.action = '/suspect/send-otp/{{ seal_id }}';
+    const csrfInput = document.createElement('input');
+    csrfInput.type = 'hidden';
+    csrfInput.name = 'csrf_token';
+    csrfInput.value = '{{ csrf_token }}';
+    form.appendChild(csrfInput);
+    document.body.appendChild(form);
+    form.submit();
+}
+</script>
+{% endblock %}
