@@ -11,11 +11,39 @@ import calendar
 import tkinter as tk
 from datetime import date, datetime
 from pathlib import Path
-from tkinter import filedialog
-from typing import Optional
+from tkinter import filedialog, ttk
+from typing import Any, Optional
 
 from .i18n import t
 from .theme import COLORS, FONTS, ToolTip, get_color, get_font
+
+# Default lower bound for calendar year selection.
+CALENDAR_MIN_YEAR = 1970
+
+
+def is_return_navigation_safe(widget: Optional[tk.Misc]) -> bool:
+    """Return True when a global <Return> press may trigger wizard navigation.
+
+    Blocks navigation while focus is inside interactive input widgets
+    (entries, multi-line text, spinboxes, comboboxes, buttons, lists)
+    so Enter keeps its native meaning there.
+    """
+    if widget is None:
+        return True
+    blocked = (
+        tk.Entry,
+        tk.Text,
+        tk.Spinbox,
+        tk.Listbox,
+        tk.Button,
+        tk.Checkbutton,
+        tk.Radiobutton,
+        ttk.Entry,      # also covers ttk.Combobox / ttk.Spinbox
+        ttk.Button,
+        ttk.Checkbutton,
+        ttk.Radiobutton,
+    )
+    return not isinstance(widget, blocked)
 
 
 class LabeledEntry(tk.Frame):
@@ -112,12 +140,18 @@ class LabeledEntry(tk.Frame):
             return len(self.get()) > 0
         return True
 
-    def highlight_error(self) -> None:
-        """Highlight the entry to indicate a validation error."""
+    def highlight_error(self, message: Optional[str] = None) -> None:
+        """Highlight the entry to indicate a validation error.
+
+        Args:
+            message: Optional custom error text; defaults to the
+                generic "required" message.
+        """
         self.entry.configure(
             highlightbackground=get_color("danger"),
             highlightcolor=get_color("danger"),
         )
+        self._error_label.configure(text=message or t("common.required"))
         self._error_label.pack(fill="x", padx=(0, 0), pady=(2, 0), anchor="e")
 
     def clear_error(self) -> None:
@@ -127,6 +161,10 @@ class LabeledEntry(tk.Frame):
             highlightcolor=get_color("primary"),
         )
         self._error_label.pack_forget()
+
+    def focus_field(self) -> None:
+        """Move keyboard focus to the entry widget."""
+        self.entry.focus_set()
 
 
 class DateEntry(tk.Frame):
@@ -143,9 +181,13 @@ class DateEntry(tk.Frame):
         *,
         required: bool = False,
         tooltip: str = "",
+        max_year_offset: int = 1,
     ) -> None:
         super().__init__(master)
         self._required = required
+        # Upper year bound is dynamic: current year + offset.
+        # Use offset 0 for birth-date fields (no future years).
+        self._max_year_offset = max_year_offset
 
         display_text = f"* {label_text}" if required else label_text
 
@@ -241,7 +283,7 @@ class DateEntry(tk.Frame):
             bg=get_color("card_bg"), font=get_font("small"),
         ).pack(side="left", padx=(0, 2))
         year_spin = tk.Spinbox(
-            header_frame, from_=1970, to=2026,
+            header_frame, from_=CALENDAR_MIN_YEAR, to=self.max_year(),
             textvariable=year_var, width=6, font=get_font("body"),
             command=lambda: _refresh_grid(),
         )
@@ -306,7 +348,7 @@ class DateEntry(tk.Frame):
             except (tk.TclError, ValueError):
                 return
 
-            if m < 1 or m > 12 or y < 1970 or y > 2026:
+            if m < 1 or m > 12 or y < CALENDAR_MIN_YEAR or y > self.max_year():
                 return
 
             cal = calendar.monthcalendar(y, m)
@@ -348,6 +390,10 @@ class DateEntry(tk.Frame):
 
     # ---- Public API (same as LabeledEntry) ----
 
+    def max_year(self) -> int:
+        """Return the dynamic upper year bound for the calendar."""
+        return date.today().year + self._max_year_offset
+
     def get(self) -> str:
         """Return the current text value."""
         return self._var.get().strip()
@@ -362,12 +408,17 @@ class DateEntry(tk.Frame):
             return len(self.get()) > 0
         return True
 
-    def highlight_error(self) -> None:
+    def focus_field(self) -> None:
+        """Move keyboard focus to the entry widget."""
+        self.entry.focus_set()
+
+    def highlight_error(self, message: Optional[str] = None) -> None:
         """Highlight the entry to indicate a validation error."""
         self.entry.configure(
             highlightbackground=get_color("danger"),
             highlightcolor=get_color("danger"),
         )
+        self._error_label.configure(text=message or t("common.required"))
         self._error_label.pack(fill="x", padx=(0, 0), pady=(2, 0), anchor="e")
 
     def clear_error(self) -> None:
@@ -455,6 +506,15 @@ class FileSelector(tk.Frame):
         )
         self._status_label.pack(side="left", padx=(4, 0))
 
+        # Error label (initially hidden)
+        self._error_label = tk.Label(
+            self,
+            text=t("common.required"),
+            fg=get_color("danger"),
+            font=get_font("small"),
+            anchor="w",
+        )
+
         # Tooltip
         if tooltip:
             ToolTip(self.path_entry, tooltip)
@@ -470,7 +530,8 @@ class FileSelector(tk.Frame):
             )
         if path:
             self._var.set(path)
-            self._status_label.configure(text="\u2713", fg=get_color("success"))
+            self._status_label.configure(text="\u2713", fg=get_color("success_text"))
+            self.clear_error()
 
     def get(self) -> str:
         """Return the selected path."""
@@ -486,6 +547,27 @@ class FileSelector(tk.Frame):
             p = self.get()
             return len(p) > 0 and Path(p).exists()
         return True
+
+    def focus_field(self) -> None:
+        """Move keyboard focus to the browse button."""
+        self.browse_btn.focus_set()
+
+    def highlight_error(self, message: Optional[str] = None) -> None:
+        """Highlight the selector to indicate a validation error."""
+        self.path_entry.configure(
+            highlightbackground=get_color("danger"),
+            highlightcolor=get_color("danger"),
+        )
+        self._error_label.configure(text=message or t("common.required"))
+        self._error_label.pack(fill="x", pady=(2, 0), anchor="e")
+
+    def clear_error(self) -> None:
+        """Remove the error highlight."""
+        self.path_entry.configure(
+            highlightbackground=get_color("border"),
+            highlightcolor=get_color("primary"),
+        )
+        self._error_label.pack_forget()
 
 
 class SignaturePad(tk.Frame):
@@ -611,3 +693,218 @@ class SignaturePad(tk.Frame):
     def get_lines(self) -> list[tuple[int, int, int, int]]:
         """Return the raw line coordinate data for serialization."""
         return list(self._lines)
+
+
+class ScrolledFrame(tk.Frame):
+    """A vertically scrollable frame container.
+
+    Place content into the ``body`` attribute.  The inner frame is
+    stretched to the canvas width so children can use ``fill="x"``.
+    Mouse-wheel scrolling is active while the pointer is inside.
+    """
+
+    def __init__(self, master: tk.Widget, *, bg: Optional[str] = None) -> None:
+        bg = bg or get_color("bg")
+        super().__init__(master, bg=bg)
+
+        self._canvas = tk.Canvas(self, highlightthickness=0, bd=0, bg=bg)
+        self._vsb = ttk.Scrollbar(
+            self, orient="vertical", command=self._canvas.yview
+        )
+        self.body = tk.Frame(self._canvas, bg=bg)
+        self._window = self._canvas.create_window(
+            (0, 0), window=self.body, anchor="nw"
+        )
+        self._canvas.configure(yscrollcommand=self._vsb.set)
+
+        self._vsb.pack(side="right", fill="y")
+        self._canvas.pack(side="left", fill="both", expand=True)
+
+        self.body.bind("<Configure>", self._on_body_configure, add="+")
+        self._canvas.bind("<Configure>", self._on_canvas_configure, add="+")
+        self._canvas.bind("<Enter>", self._bind_wheel, add="+")
+        self._canvas.bind("<Leave>", self._unbind_wheel, add="+")
+        self.bind("<Destroy>", self._on_destroy, add="+")
+
+    def _on_body_configure(self, _event: tk.Event) -> None:  # type: ignore[type-arg]
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event: tk.Event) -> None:  # type: ignore[type-arg]
+        self._canvas.itemconfigure(self._window, width=event.width)
+
+    def _is_scrollable(self) -> bool:
+        try:
+            return self.body.winfo_reqheight() > self._canvas.winfo_height()
+        except tk.TclError:
+            return False
+
+    def _on_wheel(self, event: tk.Event) -> None:  # type: ignore[type-arg]
+        if self._is_scrollable():
+            self._canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _bind_wheel(self, _event: tk.Event) -> None:  # type: ignore[type-arg]
+        try:
+            self._canvas.bind_all("<MouseWheel>", self._on_wheel)
+        except tk.TclError:
+            pass
+
+    def _unbind_wheel(self, _event: tk.Event) -> None:  # type: ignore[type-arg]
+        # <Leave> also fires when the pointer moves onto a child widget;
+        # only release the global binding when truly outside.
+        try:
+            px, py = self.winfo_pointerxy()
+            under = self.winfo_containing(px, py)
+            w: Optional[tk.Misc] = under
+            while w is not None:
+                if w is self:
+                    return
+                w = getattr(w, "master", None)
+            self._canvas.unbind_all("<MouseWheel>")
+        except (tk.TclError, KeyError):
+            pass
+
+    def _on_destroy(self, event: tk.Event) -> None:  # type: ignore[type-arg]
+        if event.widget is self:
+            try:
+                self._canvas.unbind_all("<MouseWheel>")
+            except tk.TclError:
+                pass
+
+    def scroll_to_top(self) -> None:
+        """Reset the scroll position to the top."""
+        try:
+            self._canvas.yview_moveto(0.0)
+        except tk.TclError:
+            pass
+
+
+class SummaryView(ScrolledFrame):
+    """Card-based summary renderer for wizard preview/completion steps.
+
+    Replaces the old ASCII-art ``tk.Text`` dumps with section cards
+    containing a two-column label/value grid and colored status badges.
+
+    Section dict format::
+
+        {
+            "title": "사건 정보",
+            "badge": ("일치", "success"),          # optional
+            "rows": [
+                ("사건번호", "2026-123"),          # plain row
+                ("해시 검증", "통과", "success"),  # status-colored value
+                ("", "안내 문구만 있는 행"),       # note row (spans width)
+            ],
+        }
+    """
+
+    _STATUS_TOKENS = {
+        "success": "success_text",
+        "danger": "danger_text",
+        "warning": "warning_text",
+        "info": "info_text",
+    }
+
+    VALUE_WRAP = 560
+
+    def __init__(self, master: tk.Widget) -> None:
+        super().__init__(master, bg=get_color("bg"))
+
+    @staticmethod
+    def _strip_brackets(text: str) -> str:
+        """Strip bracket/space decoration from legacy i18n section titles."""
+        return text.strip("[] ")
+
+    def render(self, sections: list[dict[str, Any]]) -> None:
+        """Clear and re-render all section cards."""
+        for child in self.body.winfo_children():
+            child.destroy()
+
+        for section in sections:
+            self._render_section(section)
+        self.scroll_to_top()
+
+    # ------------------------------------------------------------------
+
+    def _render_section(self, section: dict[str, Any]) -> None:
+        card = tk.Frame(
+            self.body,
+            bg=get_color("card_bg"),
+            highlightthickness=1,
+            highlightbackground=get_color("border"),
+        )
+        card.pack(fill="x", pady=(0, 8), padx=(0, 4))
+
+        inner = tk.Frame(card, bg=get_color("card_bg"), padx=14, pady=10)
+        inner.pack(fill="both", expand=True)
+
+        # Title row (+ optional badge)
+        title = section.get("title", "")
+        if title or section.get("badge"):
+            title_row = tk.Frame(inner, bg=get_color("card_bg"))
+            title_row.pack(fill="x", pady=(0, 6))
+            if title:
+                tk.Label(
+                    title_row,
+                    text=title,
+                    font=get_font("subheader"),
+                    fg=get_color("heading"),
+                    bg=get_color("card_bg"),
+                    anchor="w",
+                ).pack(side="left")
+            badge = section.get("badge")
+            if badge:
+                badge_text, badge_status = badge
+                tk.Label(
+                    title_row,
+                    text=f"● {badge_text}",
+                    font=get_font("badge"),
+                    fg=self._status_color(badge_status),
+                    bg=get_color("card_bg"),
+                ).pack(side="right")
+
+        grid = tk.Frame(inner, bg=get_color("card_bg"))
+        grid.pack(fill="x")
+        grid.grid_columnconfigure(1, weight=1)
+
+        for row_idx, row in enumerate(section.get("rows", [])):
+            label = row[0]
+            value = row[1]
+            status = row[2] if len(row) > 2 else None
+            if label:
+                tk.Label(
+                    grid,
+                    text=label,
+                    font=get_font("small"),
+                    fg=get_color("text_secondary"),
+                    bg=get_color("card_bg"),
+                    anchor="nw",
+                    justify="left",
+                ).grid(row=row_idx, column=0, sticky="nw", padx=(0, 16), pady=2)
+                value_col, colspan = 1, 1
+            else:
+                value_col, colspan = 0, 2
+
+            fg = self._status_color(status) if status else get_color("text")
+            font = (
+                (FONTS["body"][0], FONTS["body"][1], "bold")
+                if status
+                else get_font("body")
+            )
+            tk.Label(
+                grid,
+                text=str(value),
+                font=font,
+                fg=fg,
+                bg=get_color("card_bg"),
+                anchor="nw",
+                justify="left",
+                wraplength=self.VALUE_WRAP,
+            ).grid(
+                row=row_idx, column=value_col, columnspan=colspan,
+                sticky="nw", pady=2,
+            )
+
+    @classmethod
+    def _status_color(cls, status: Optional[str]) -> str:
+        token = cls._STATUS_TOKENS.get(status or "", "text")
+        return get_color(token)

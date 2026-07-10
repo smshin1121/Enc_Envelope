@@ -34,6 +34,14 @@ COLORS = {
     "warning": "#f39c12",
     "info": "#3498db",
 
+    # High-contrast text variants for status colors (WCAG AA >= 4.5:1 on white).
+    # Use these for foreground TEXT on light backgrounds; the base status
+    # colors above remain for fills, bars, and dots.
+    "success_text": "#0e7a3d",   # 5.4:1 on #ffffff
+    "warning_text": "#9a6200",   # 5.1:1 on #ffffff
+    "danger_text": "#c41d52",    # 5.8:1 on #ffffff
+    "info_text": "#186ba0",      # 5.7:1 on #ffffff
+
     # Surfaces
     "bg": "#f8f9fb",
     "card_bg": "#ffffff",
@@ -65,6 +73,32 @@ COLORS = {
 
     # System panel background
     "panel_bg": "#f0f2f5",
+
+    # Screen headers (deep navy banner used by dashboard / case manager /
+    # section headers; wizards adopt these tokens in the next wave)
+    "header_bg": "#061b31",
+    "header_fg": "#ffffff",
+    "header_fg_muted": "#a8c4e0",
+    "header_hover_bg": "#0d2a47",
+
+    # Wizard header accents (per process type)
+    "wizard_header_seal": "#2c3e50",
+    "wizard_header_unseal": "#1a5276",
+    "wizard_header_reseal": "#1e6e3e",
+
+    # Notice / alerts section header (deep purple)
+    "notice_header": "#3d1a54",
+
+    # Workflow action buttons (teal)
+    "workflow_accent": "#1a8a5e",
+    "workflow_accent_hover": "#15724e",
+
+    # Quick-action card accents (dashboard cards; generic names so the
+    # wizard wave can reuse them)
+    "accent_seal": "#3366cc",
+    "accent_unseal": "#1a5276",
+    "accent_reseal": "#1e8e4e",
+    "accent_info": "#7c3aed",
 }
 
 FONTS = {
@@ -73,7 +107,7 @@ FONTS = {
     "subheader": ("맑은 고딕", 12, "bold"),
     "body": ("맑은 고딕", 11, "normal"),
     "small": ("맑은 고딕", 10, "normal"),
-    "caption": ("맑은 고딕", 9, "normal"),
+    "caption": ("맑은 고딕", 10, "normal"),
     "button": ("맑은 고딕", 11, "bold"),
     "badge": ("맑은 고딕", 9, "bold"),
     "mono": ("Consolas", 10, "normal"),
@@ -85,6 +119,10 @@ SPACING = {"xs": 4, "sm": 8, "md": 16, "lg": 24, "xl": 32, "2xl": 48}
 
 RADIUS = {"sm": 4, "standard": 6, "md": 8, "lg": 12}
 
+# NOTE: tkinter cannot render rgba() values — these are design-reference
+# constants only (from DESIGN.md) and MUST NOT be passed to any widget
+# option. For a shadow effect use the opaque COLORS["shadow"] /
+# COLORS["shadow_light"] frame-offset technique instead.
 SHADOWS = {
     "card": "rgba(50,50,93,0.12)",
     "hover": "rgba(50,50,93,0.15)",
@@ -253,6 +291,31 @@ def apply_theme(root: tk.Tk) -> None:
         foreground=COLORS["heading"],
         background=COLORS["card_bg"],
     )
+
+    # Focused buttons: Enter = click.  tk/ttk buttons have no default
+    # <Return> binding (only <space>), and the wizards' Return guard
+    # (is_return_navigation_safe) deliberately skips global navigation
+    # while a button has focus — without this class binding, pressing
+    # Enter on a focused button would be swallowed entirely.
+    root.bind_class("Button", "<Return>", _invoke_focused_button)
+    root.bind_class("TButton", "<Return>", _invoke_focused_button)
+
+
+def _invoke_focused_button(event: "tk.Event[tk.Misc]") -> str:
+    """Invoke the focused button on <Return>, mimicking a click.
+
+    Returns "break" to stop the event from propagating to toplevel
+    <Return> bindings (wizard '다음' navigation), so Enter on a button
+    activates only that button.
+    """
+    widget = event.widget
+    try:
+        if str(widget.cget("state")) == "disabled":
+            return "break"
+        widget.invoke()  # type: ignore[attr-defined]
+    except (tk.TclError, AttributeError):
+        pass
+    return "break"
 
 
 class ToolTip:

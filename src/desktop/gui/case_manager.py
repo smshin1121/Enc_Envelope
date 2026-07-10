@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
+import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -59,11 +61,22 @@ class CaseManager(tk.Frame):
         self._app = app
         self._on_back = on_back
         self._all_cases: list[dict[str, Any]] = []
+        self._loading = False
+        self._selection_buttons: list[tk.Button] = []
+        # Thread-safe channel: worker threads put results here and the Tk
+        # main loop polls it (after() is not safe to call off-thread).
+        self._result_queue: queue.Queue = queue.Queue()
+        self._poll_after_id: Optional[str] = None
+        # Cancel any pending poll timer on destroy — otherwise the timer
+        # fires after the widget's Tcl command is deleted and Tk prints
+        # an "invalid command name" background error.
+        self.bind("<Destroy>", self._cancel_poll, add="+")
 
         self._build_header()
         self._build_search_bar()
         self._build_treeview()
         self._build_action_bar()
+        self._update_action_states()
         self._refresh_list()
 
     # ------------------------------------------------------------------
@@ -72,7 +85,7 @@ class CaseManager(tk.Frame):
 
     def _build_header(self) -> None:
         # Dark navy header for strong visual identity
-        _case_header_bg = "#061b31"
+        _case_header_bg = get_color("header_bg")
         header = tk.Frame(self, bg=_case_header_bg, height=56)
         header.pack(fill="x")
         header.pack_propagate(False)
@@ -80,7 +93,7 @@ class CaseManager(tk.Frame):
         tk.Label(
             header,
             text=t("case.title"),
-            fg="#ffffff",
+            fg=get_color("header_fg"),
             bg=_case_header_bg,
             font=get_font("title"),
         ).pack(side="left", padx=16)
@@ -90,9 +103,9 @@ class CaseManager(tk.Frame):
             text=t("case.back_home"),
             command=self._go_back,
             bg=_case_header_bg,
-            fg="#a8c4e0",
-            activebackground="#0d2a47",
-            activeforeground="#ffffff",
+            fg=get_color("header_fg_muted"),
+            activebackground=get_color("header_hover_bg"),
+            activeforeground=get_color("header_fg"),
             relief="flat",
             font=get_font("small"),
             bd=0,
@@ -104,9 +117,9 @@ class CaseManager(tk.Frame):
             text=t("case.new_case"),
             command=self._on_new_case,
             bg=get_color("primary"),
-            fg="#ffffff",
+            fg=get_color("text_light"),
             activebackground=get_color("primary_hover"),
-            activeforeground="#ffffff",
+            activeforeground=get_color("text_light"),
             relief="flat",
             font=get_font("button"),
             bd=0,
@@ -206,109 +219,212 @@ class CaseManager(tk.Frame):
 
         self._tree.bind("<Double-1>", lambda _e: self._on_detail())
         self._tree.bind("<Button-3>", self._show_context_menu)
+        self._tree.bind("<<TreeviewSelect>>", lambda _e: self._update_action_states())
+
+        # Empty-state overlay (shown when the list has no cases)
+        self._empty_frame = tk.Frame(tree_frame, bg=get_color("card_bg"))
+        tk.Label(
+            self._empty_frame,
+            text=t("case.empty_state"),
+            font=get_font("subheader"),
+            fg=get_color("text_secondary"),
+            bg=get_color("card_bg"),
+        ).pack(pady=(0, 4))
+        tk.Label(
+            self._empty_frame,
+            text=t("case.empty_state_hint"),
+            font=get_font("small"),
+            fg=get_color("text_secondary"),
+            bg=get_color("card_bg"),
+        ).pack(pady=(0, 8))
+        tk.Button(
+            self._empty_frame,
+            text=t("case.new_case"),
+            command=self._on_new_case,
+            font=get_font("button"),
+            fg=get_color("text_light"),
+            bg=get_color("primary"),
+            activebackground=get_color("primary_hover"),
+            activeforeground=get_color("text_light"),
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=4,
+            cursor="hand2",
+        ).pack()
+
+    def _set_empty_state(self, show: bool) -> None:
+        """Show or hide the empty-state overlay above the treeview."""
+        if show:
+            self._empty_frame.place(relx=0.5, rely=0.4, anchor="center")
+        else:
+            self._empty_frame.place_forget()
 
     def _build_action_bar(self) -> None:
-        bar = tk.Frame(self, padx=16, pady=8, bg=get_color("bg"))
+        """Two-row action bar; selection-dependent buttons start disabled.
+
+        Row 1: record viewing actions + delete (right).
+        Row 2: workflow actions — keeps the bar usable at 800px width.
+        """
+        bar = tk.Frame(self, padx=16, pady=4, bg=get_color("bg"))
         bar.pack(fill="x")
+        row1 = tk.Frame(bar, bg=get_color("bg"))
+        row1.pack(fill="x", pady=(0, 4))
+        row2 = tk.Frame(bar, bg=get_color("bg"))
+        row2.pack(fill="x", pady=(0, 4))
 
         # Primary action buttons — purple filled style
         ghost_cfg = {
-            "font": ("맑은 고딕", 11, "bold"),
+            "font": get_font("button"),
             "width": 12,
-            "fg": "#ffffff",
+            "fg": get_color("text_light"),
             "bg": get_color("primary"),
             "activebackground": get_color("primary_hover"),
-            "activeforeground": "#ffffff",
+            "activeforeground": get_color("text_light"),
             "relief": "flat",
             "bd": 0,
             "padx": 8,
             "pady": 4,
         }
 
-        tk.Button(bar, text=t("case.detail"), command=self._on_detail, **ghost_cfg).pack(
-            side="left", padx=4
-        )
-        tk.Button(bar, text=t("case.artifacts"), command=self._on_artifacts, **ghost_cfg).pack(
-            side="left", padx=4
-        )
-        tk.Button(bar, text=t("case.history"), command=self._on_history, **ghost_cfg).pack(
-            side="left", padx=4
-        )
-        tk.Button(
-            bar, text=t("case.open_pdf"), command=self._on_open_pdf, **ghost_cfg
-        ).pack(side="left", padx=4)
+        for text_key, command in (
+            ("case.detail", self._on_detail),
+            ("case.artifacts", self._on_artifacts),
+            ("case.history", self._on_history),
+            ("case.open_pdf", self._on_open_pdf),
+        ):
+            btn = tk.Button(row1, text=t(text_key), command=command, **ghost_cfg)
+            btn.pack(side="left", padx=4)
+            self._selection_buttons.append(btn)
 
         # Workflow action buttons — teal style
         workflow_cfg = {
-            "font": ("맑은 고딕", 11, "bold"),
+            "font": get_font("button"),
             "width": 14,
-            "fg": "#ffffff",
-            "bg": "#1a8a5e",
-            "activebackground": "#15724e",
-            "activeforeground": "#ffffff",
+            "fg": get_color("text_light"),
+            "bg": get_color("workflow_accent"),
+            "activebackground": get_color("workflow_accent_hover"),
+            "activeforeground": get_color("text_light"),
             "relief": "flat",
             "bd": 0,
             "padx": 8,
             "pady": 4,
         }
 
-        tk.Button(
-            bar, text=t("case.start_seal"),
-            command=self._on_start_seal, **workflow_cfg,
-        ).pack(side="left", padx=4)
-        tk.Button(
-            bar, text=t("case.start_unseal"),
-            command=self._on_start_unseal, **workflow_cfg,
-        ).pack(side="left", padx=4)
-        tk.Button(
-            bar, text=t("case.start_reseal"),
-            command=self._on_start_reseal, **workflow_cfg,
-        ).pack(side="left", padx=4)
+        for text_key, command in (
+            ("case.start_seal", self._on_start_seal),
+            ("case.start_unseal", self._on_start_unseal),
+            ("case.start_reseal", self._on_start_reseal),
+        ):
+            btn = tk.Button(row2, text=t(text_key), command=command, **workflow_cfg)
+            btn.pack(side="left", padx=4)
+            self._selection_buttons.append(btn)
 
         # Delete button — danger style
-        tk.Button(
-            bar,
+        delete_btn = tk.Button(
+            row1,
             text=t("case.delete"),
             command=self._on_delete,
             fg=get_color("text_light"),
             bg=get_color("danger"),
             activebackground=get_color("danger_hover"),
-            activeforeground="white",
+            activeforeground=get_color("text_light"),
             font=get_font("button"),
             width=12,
             relief="flat",
-        ).pack(side="right", padx=4)
+        )
+        delete_btn.pack(side="right", padx=4)
+        self._selection_buttons.append(delete_btn)
+
+    def _update_action_states(self) -> None:
+        """Enable selection-dependent buttons only when a case is selected."""
+        state = "normal" if self._tree.selection() else "disabled"
+        for btn in self._selection_buttons:
+            try:
+                btn.configure(state=state)
+            except tk.TclError:
+                pass
 
     # ------------------------------------------------------------------
     # Data operations
     # ------------------------------------------------------------------
 
     def _refresh_list(self) -> None:
-        """Reload all cases from DB and populate the tree."""
+        """Reload all cases from DB on a worker thread and populate the tree."""
         self._search_var.set("")
-        try:
-            from desktop.db import list_all_cases
-            self._all_cases = list_all_cases(self._app.db_path)
-        except Exception as exc:
-            logger.error("케이스 목록 조회 실패: %s", exc)
-            self._all_cases = []
-
-        self._populate_tree(self._all_cases)
+        self._load_cases_async(keyword=None)
 
     def _do_search(self) -> None:
         keyword = self._search_var.get().strip()
         if not keyword:
             self._refresh_list()
             return
-        try:
-            from desktop.db import search_cases
-            results = search_cases(self._app.db_path, keyword)
-        except Exception as exc:
-            logger.error("검색 실패: %s", exc)
-            results = []
+        self._load_cases_async(keyword=keyword)
 
-        self._all_cases = results
-        self._populate_tree(results)
+    def _load_cases_async(self, *, keyword: Optional[str]) -> None:
+        """Query the case list off the main thread; apply via after()."""
+        if self._loading:
+            return
+        self._loading = True
+        self._count_label.configure(text=t("case.loading"))
+
+        def _worker() -> None:
+            cases: list[dict[str, Any]] = []
+            try:
+                if keyword:
+                    from desktop.db import search_cases
+                    cases = search_cases(self._app.db_path, keyword)
+                else:
+                    from desktop.db import list_all_cases
+                    cases = list_all_cases(self._app.db_path)
+            except Exception as exc:
+                logger.error("케이스 목록 조회 실패: %s", exc)
+                cases = []
+
+            # Hand off to the Tk main loop via the polled queue (thread-safe)
+            self._result_queue.put(cases)
+
+        threading.Thread(
+            target=_worker, daemon=True, name="case-list-load"
+        ).start()
+        self._poll_worker_result()
+
+    def _poll_worker_result(self) -> None:
+        """Poll the result queue from the Tk main loop (thread-safe)."""
+        self._poll_after_id = None
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+
+        try:
+            cases = self._result_queue.get_nowait()
+        except queue.Empty:
+            self._poll_after_id = self.after(100, self._poll_worker_result)
+            return
+
+        self._apply_cases(cases)
+
+    def _cancel_poll(self, _event: "tk.Event | None" = None) -> None:
+        """Cancel the pending poll timer (bound to <Destroy>)."""
+        if self._poll_after_id is not None:
+            try:
+                self.after_cancel(self._poll_after_id)
+            except tk.TclError:
+                pass
+            self._poll_after_id = None
+
+    def _apply_cases(self, cases: list[dict[str, Any]]) -> None:
+        """Apply worker results to the tree (main thread only)."""
+        self._loading = False
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        self._all_cases = cases
+        self._populate_tree(cases)
 
     def _populate_tree(self, cases: list[dict[str, Any]]) -> None:
         self._tree.delete(*self._tree.get_children())
@@ -329,6 +445,8 @@ class CaseManager(tk.Frame):
                 tags=(tag,),
             )
         self._count_label.configure(text=t("case.total_count").format(count=len(cases)))
+        self._set_empty_state(len(cases) == 0)
+        self._update_action_states()
 
     def _sort_by_column(self, col: str) -> None:
         """Sort treeview by the given column."""
@@ -414,7 +532,17 @@ class CaseManager(tk.Frame):
             from desktop.db import delete_case
             deleted = delete_case(self._app.db_path, seal_id)
             if deleted:
-                messagebox.showinfo(t("case.delete_done"), f"'{seal_id}' {t('case.delete_done')}")
+                toasts = getattr(self._app, "toasts", None)
+                if toasts is not None:
+                    toasts.show(
+                        self._app.root,
+                        t("case.delete_toast").format(seal_id=seal_id),
+                        toast_type="success",
+                    )
+                else:
+                    messagebox.showinfo(
+                        t("case.delete_done"), f"'{seal_id}' {t('case.delete_done')}"
+                    )
                 self._refresh_list()
             else:
                 messagebox.showwarning(t("case.not_found_title"), t("case.not_found"))
@@ -625,10 +753,10 @@ class NewCaseDialog(tk.Toplevel):
         tk.Button(
             btn_frame, text=t("case.create"), width=10,
             command=self._do_create,
-            fg="#ffffff",
+            fg=get_color("text_light"),
             bg=get_color("primary"),
             activebackground=get_color("primary_hover"),
-            activeforeground="#ffffff",
+            activeforeground=get_color("text_light"),
             relief="flat",
             font=get_font("button"),
         ).pack(side="right", padx=4)

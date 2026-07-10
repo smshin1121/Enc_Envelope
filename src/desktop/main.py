@@ -7,6 +7,7 @@ the Tkinter GUI application.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -71,12 +72,46 @@ def _ensure_master_key(master_key_path: str) -> None:
     if not Path(master_key_path).exists():
         init_master_key(master_key_path)
         logging.getLogger(__name__).info(
-            "마스터키 생성 완료: %s", master_key_path
+            "Master key created: %s", master_key_path
         )
     else:
         logging.getLogger(__name__).info(
-            "마스터키 확인 완료: %s", master_key_path
+            "Master key ready: %s", master_key_path
         )
+
+    # Crypto/KMS helpers resolve the active master key path via env var.
+    os.environ["MASTER_KEY_PATH"] = master_key_path
+
+
+def _enable_dpi_awareness() -> None:
+    """Opt in to per-monitor DPI awareness on Windows.
+
+    Must be called BEFORE the Tk root window is created so that tkinter
+    renders crisply at 125~200% display scaling. Safe no-op on non-Windows
+    platforms or if the call fails.
+    """
+    try:
+        import ctypes
+
+        try:
+            # 1 = PROCESS_SYSTEM_DPI_AWARE (Windows 8.1+)
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            # Fallback for older Windows versions
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        # Non-Windows platform or ctypes unavailable — ignore
+        pass
+
+
+def _ensure_tsa_service() -> None:
+    """Create TSA credentials and start the local TSA server."""
+    from desktop.signature import ensure_tsa_server_running
+
+    tsa_url, cert_path = ensure_tsa_server_running()
+    logging.getLogger(__name__).info(
+        "Local TSA ready: %s (cert=%s)", tsa_url, cert_path
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +122,7 @@ def main() -> None:
     """Application entry point."""
     _setup_logging()
     logger = logging.getLogger(__name__)
-    logger.info("디지털증거 전자봉인시스템 시작")
+    logger.info("Starting digital evidence sealing system")
 
     db_path = _get_db_path()
     master_key_path = _get_master_key_path()
@@ -95,16 +130,18 @@ def main() -> None:
     try:
         _init_database(db_path)
         _ensure_master_key(master_key_path)
+        _ensure_tsa_service()
     except Exception:
-        logger.exception("초기화 실패")
+        logger.exception("Initialization failed")
         sys.exit(1)
 
     from desktop.gui import MainApp
 
+    _enable_dpi_awareness()
     app = MainApp(db_path=db_path)
-    logger.info("GUI 시작")
+    logger.info("Launching GUI")
     app.run()
-    logger.info("프로그램 종료")
+    logger.info("Program exited")
 
 
 if __name__ == "__main__":

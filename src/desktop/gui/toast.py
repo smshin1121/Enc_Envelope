@@ -20,16 +20,16 @@ _TOAST_ACCENT: dict[str, str] = {
     "warning": COLORS["warning"],  # #f39c12
 }
 
-# Map toast types to text color
+# Map toast types to text color (high-contrast variants for text on white)
 _TOAST_TEXT_COLOR: dict[str, str] = {
     "info": COLORS["text"],
     "success": COLORS["text"],
-    "error": COLORS["danger"],
+    "error": COLORS["danger_text"],
     "warning": COLORS["text"],
 }
 
-# Toast height + gap for stacking
-_TOAST_HEIGHT = 50
+# Gap between stacked toasts (heights are measured per-toast so that
+# multi-line messages do not overlap)
 _TOAST_GAP = 8
 
 
@@ -75,6 +75,8 @@ class _ToastPopup:
         self._window.update_idletasks()
         toast_width = max(self._window.winfo_reqwidth(), 300)
         toast_height = self._window.winfo_reqheight()
+        # Expose the real height so the manager can stack without overlap
+        self.height = toast_height
 
         root_x = root.winfo_rootx()
         root_y = root.winfo_rooty()
@@ -84,10 +86,25 @@ class _ToastPopup:
         x = root_x + root_w - toast_width - 16
         y = root_y + root_h - toast_height - 16 - y_offset
 
+        self.width = toast_width
         self._window.wm_geometry(f"{toast_width}x{toast_height}+{x}+{y}")
 
         # Schedule auto-dismiss
         self._after_id = root.after(duration, self.close)
+
+    def move_to(self, y_offset: int) -> None:
+        """Reposition the toast for the given stack offset from the bottom."""
+        try:
+            root_x = self._root.winfo_rootx()
+            root_y = self._root.winfo_rooty()
+            root_w = self._root.winfo_width()
+            root_h = self._root.winfo_height()
+
+            x = root_x + root_w - self.width - 16
+            y = root_y + root_h - self.height - 16 - y_offset
+            self._window.wm_geometry(f"+{x}+{y}")
+        except tk.TclError:
+            pass
 
     def close(self) -> None:
         """Destroy the toast window and notify the manager."""
@@ -136,7 +153,11 @@ class ToastManager:
         """
         accent_color = _TOAST_ACCENT.get(toast_type, _TOAST_ACCENT["info"])
         text_color = _TOAST_TEXT_COLOR.get(toast_type, COLORS["text"])
-        y_offset = len(self._active_toasts) * (_TOAST_HEIGHT + _TOAST_GAP)
+        # Stack by the ACTUAL height of each active toast (multi-line safe)
+        y_offset = sum(
+            getattr(toast, "height", 0) + _TOAST_GAP
+            for toast in self._active_toasts
+        )
 
         toast = _ToastPopup(
             root=root,
@@ -150,6 +171,14 @@ class ToastManager:
         self._active_toasts.append(toast)
 
     def _on_toast_close(self, toast: _ToastPopup) -> None:
-        """Remove a closed toast from the active list."""
+        """Remove a closed toast and restack the remaining ones."""
         if toast in self._active_toasts:
             self._active_toasts.remove(toast)
+        self._restack()
+
+    def _restack(self) -> None:
+        """Reposition remaining toasts so no gap is left by closed ones."""
+        y_offset = 0
+        for toast in self._active_toasts:
+            toast.move_to(y_offset)
+            y_offset += getattr(toast, "height", 0) + _TOAST_GAP

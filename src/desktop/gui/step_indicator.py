@@ -3,10 +3,18 @@
 Renders a sequence of numbered circles connected by lines.
 Each step has three visual states: completed, active, and pending.
 Styled per DESIGN.md Step Indicator specifications.
+
+Interaction:
+- Mouse: clicks are accepted only within ``CLICK_RADIUS`` px of a
+  step circle center (no infinite hit area).
+- Keyboard: the widget is focusable (Tab); Left/Right moves the
+  focused step among visitable steps (up to the active one) and
+  Return/Space activates it.
 """
 
 from __future__ import annotations
 
+import math
 import tkinter as tk
 from typing import Optional
 
@@ -18,6 +26,7 @@ class StepIndicator(tk.Canvas):
 
     CIRCLE_RADIUS = 16  # 32px diameter — more prominent
     LINE_HEIGHT = 3
+    CLICK_RADIUS = 24   # max distance from a circle center to accept a click
 
     STATE_COMPLETED = "completed"  # Filled purple circle + white checkmark
     STATE_ACTIVE = "active"        # Filled purple circle + white number
@@ -33,15 +42,24 @@ class StepIndicator(tk.Canvas):
         kwargs.setdefault("height", 68)
         kwargs.setdefault("highlightthickness", 0)
         kwargs.setdefault("bg", get_color("card_bg"))
+        kwargs.setdefault("takefocus", 1)
         super().__init__(master, **kwargs)
 
         self._steps = list(steps)
         self._active_index = 0
+        self._focus_index: Optional[int] = None
         self._on_step_click = on_step_click
         self._positions: list[int] = []
+        self._circle_cy = self.CIRCLE_RADIUS + 4
 
         self.bind("<Configure>", self._on_configure)
         self.bind("<Button-1>", self._on_canvas_click)
+        self.bind("<FocusIn>", self._on_focus_in)
+        self.bind("<FocusOut>", self._on_focus_out)
+        self.bind("<Left>", self._on_key_left)
+        self.bind("<Right>", self._on_key_right)
+        self.bind("<Return>", self._on_key_activate)
+        self.bind("<space>", self._on_key_activate)
 
     # ------------------------------------------------------------------
     # Public API
@@ -51,11 +69,51 @@ class StepIndicator(tk.Canvas):
         """Set the given step as active.
 
         Steps before *index* become completed; steps after become pending.
+        Out-of-range indices are clamped into the valid range.
         """
-        if index < 0 or index >= len(self._steps):
+        if not self._steps:
             return
+        index = max(0, min(index, len(self._steps) - 1))
         self._active_index = index
+        # Keep keyboard focus within the visitable range
+        if self._focus_index is not None:
+            self._focus_index = min(self._focus_index, index)
         self._draw()
+
+    # ------------------------------------------------------------------
+    # Keyboard navigation
+    # ------------------------------------------------------------------
+
+    def _on_focus_in(self, _event: tk.Event) -> None:  # type: ignore[type-arg]
+        if self._focus_index is None:
+            self._focus_index = self._active_index
+        self._draw()
+
+    def _on_focus_out(self, _event: tk.Event) -> None:  # type: ignore[type-arg]
+        self._focus_index = None
+        self._draw()
+
+    def _move_focus(self, delta: int) -> str:
+        if self._focus_index is None:
+            self._focus_index = self._active_index
+        # Only already-visited steps (<= active) are visitable
+        new_index = self._focus_index + delta
+        self._focus_index = max(0, min(new_index, self._active_index))
+        self._draw()
+        return "break"
+
+    def _on_key_left(self, _event: tk.Event) -> str:  # type: ignore[type-arg]
+        return self._move_focus(-1)
+
+    def _on_key_right(self, _event: tk.Event) -> str:  # type: ignore[type-arg]
+        return self._move_focus(1)
+
+    def _on_key_activate(self, _event: tk.Event) -> str:  # type: ignore[type-arg]
+        # "break" prevents the wizard-level toplevel <Return> binding
+        # from also advancing to the next step.
+        if self._on_step_click is not None and self._focus_index is not None:
+            self._on_step_click(self._focus_index)
+        return "break"
 
     # ------------------------------------------------------------------
     # Internal drawing
@@ -79,6 +137,7 @@ class StepIndicator(tk.Canvas):
         r = self.CIRCLE_RADIUS
         # Vertical center for circles -- leave room for label below
         cy = r + 4
+        self._circle_cy = cy
         # Horizontal padding
         pad = max(r + 8, 30)
         usable = width - 2 * pad
@@ -98,6 +157,8 @@ class StepIndicator(tk.Canvas):
         color_line_done = get_color("primary")
         color_line_pending = get_color("pending_border")
         color_heading = get_color("heading")       # #061b31
+        color_text_light = get_color("text_light")
+        color_glow = get_color("border_active")
 
         # Draw connecting lines first (behind circles)
         for i in range(n - 1):
@@ -119,8 +180,8 @@ class StepIndicator(tk.Canvas):
         # Draw circles and labels — bold active/completed, normal pending
         label_font_normal = (FONTS["body"][0], FONTS["body"][1])
         label_font_bold = (FONTS["body"][0], FONTS["body"][1], "bold")
-        num_font = (FONTS["body"][0], 11, "bold")
-        check_font = (FONTS["body"][0], 13, "bold")
+        num_font = (FONTS["body"][0], FONTS["body"][1], "bold")
+        check_font = (FONTS["subheader"][0], FONTS["subheader"][1] + 1, "bold")
 
         for i, (cx, step_name) in enumerate(zip(positions, self._steps)):
             state = self._get_state(i)
@@ -136,8 +197,8 @@ class StepIndicator(tk.Canvas):
                 # White checkmark — larger
                 self.create_text(
                     cx, cy,
-                    text="\u2713",
-                    fill="white",
+                    text="✓",
+                    fill=color_text_light,
                     font=check_font,
                 )
             elif state == self.STATE_ACTIVE:
@@ -146,7 +207,7 @@ class StepIndicator(tk.Canvas):
                 self.create_oval(
                     cx - glow_r, cy - glow_r, cx + glow_r, cy + glow_r,
                     fill="",
-                    outline="#b9b9f9",
+                    outline=color_glow,
                     width=2,
                 )
                 # Filled purple circle + white number
@@ -160,14 +221,14 @@ class StepIndicator(tk.Canvas):
                 self.create_text(
                     cx, cy,
                     text=str(i + 1),
-                    fill="white",
+                    fill=color_text_light,
                     font=num_font,
                 )
             else:
                 # Pending: border only + grey number
                 self.create_oval(
                     cx - r, cy - r, cx + r, cy + r,
-                    fill="white",
+                    fill=get_color("card_bg"),
                     outline=color_pending_border,
                     width=2,
                 )
@@ -177,6 +238,21 @@ class StepIndicator(tk.Canvas):
                     text=str(i + 1),
                     fill=color_pending_text,
                     font=num_font,
+                )
+
+            # Keyboard focus ring (dashed) around the focused step
+            try:
+                has_focus = self.focus_get() is self
+            except (KeyError, tk.TclError):
+                has_focus = False
+            if self._focus_index == i and has_focus:
+                ring_r = r + 6
+                self.create_oval(
+                    cx - ring_r, cy - ring_r, cx + ring_r, cy + ring_r,
+                    fill="",
+                    outline=color_primary,
+                    width=1,
+                    dash=(3, 2),
                 )
 
             # Step label below circle — bold for active
@@ -207,17 +283,18 @@ class StepIndicator(tk.Canvas):
         return self.STATE_PENDING
 
     def _on_canvas_click(self, event: tk.Event) -> None:  # type: ignore[type-arg]
-        """Find the closest step to the click position and invoke callback."""
+        """Invoke the callback if the click lands near a step circle.
+
+        Only clicks within ``CLICK_RADIUS`` px of a circle center are
+        accepted — clicks in the empty space between steps are ignored.
+        """
         if not self._on_step_click or not self._positions:
             return
 
-        # Find closest step by x-coordinate
-        min_dist = float("inf")
-        closest_idx = 0
+        cy = self._circle_cy
         for i, cx in enumerate(self._positions):
-            dist = abs(event.x - cx)
-            if dist < min_dist:
-                min_dist = dist
-                closest_idx = i
-
-        self._on_step_click(closest_idx)
+            dist = math.hypot(event.x - cx, event.y - cy)
+            if dist <= self.CLICK_RADIUS:
+                self._focus_index = i
+                self._on_step_click(i)
+                return

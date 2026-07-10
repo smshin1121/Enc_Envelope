@@ -71,6 +71,14 @@ _TRANSLATIONS = {
         "ko": "한국어로 전환",
         "en": "한국어로 전환",
     },
+    "lang.changed": {
+        "ko": "언어가 변경되었습니다",
+        "en": "Language changed",
+    },
+    "lang.applied_next": {
+        "ko": "진행 중인 화면에는 다음 화면부터 언어가 적용됩니다",
+        "en": "Language will apply from the next screen",
+    },
 
     # Dashboard
     "dashboard.title": {
@@ -116,6 +124,20 @@ _TRANSLATIONS = {
         "ko": "작업 이력이 없습니다",
         "en": "No activity records",
     },
+    "dashboard.no_activity_hint": {
+        "ko": "첫 봉인을 시작하면 이곳에 작업 이력이 표시됩니다.",
+        "en": "Once you seal evidence, activity will appear here.",
+    },
+    "dashboard.empty_cta": {"ko": "첫 봉인 시작", "en": "Start First Seal"},
+    "dashboard.loading": {"ko": "불러오는 중...", "en": "Loading..."},
+    "dashboard.refresh_done": {
+        "ko": "대시보드를 새로고침했습니다",
+        "en": "Dashboard refreshed",
+    },
+    "dashboard.col_time": {"ko": "일시", "en": "Time"},
+    "dashboard.col_type": {"ko": "유형", "en": "Type"},
+    "dashboard.col_seal_id": {"ko": "Seal ID", "en": "Seal ID"},
+    "dashboard.stat_na": {"ko": "N/A", "en": "N/A"},
 
     # Seal wizard
     "seal.title": {"ko": "봉인 프로세스", "en": "Sealing Process"},
@@ -331,6 +353,19 @@ _TRANSLATIONS = {
     "case.delete_done": {"ko": "삭제 완료", "en": "Deleted"},
     "case.not_found": {"ko": "해당 케이스를 찾을 수 없습니다.", "en": "Case not found."},
     "case.not_found_title": {"ko": "없음", "en": "Not Found"},
+    "case.loading": {"ko": "불러오는 중...", "en": "Loading..."},
+    "case.empty_state": {
+        "ko": "등록된 케이스가 없습니다",
+        "en": "No cases yet",
+    },
+    "case.empty_state_hint": {
+        "ko": "새 케이스를 생성하여 봉인 절차를 시작하세요.",
+        "en": "Create a new case to start the sealing workflow.",
+    },
+    "case.delete_toast": {
+        "ko": "케이스 '{seal_id}'가 삭제되었습니다",
+        "en": "Case '{seal_id}' deleted",
+    },
 
     # Case detail dialog
     "case_detail.title": {"ko": "케이스 상세", "en": "Case Detail"},
@@ -635,6 +670,21 @@ _TRANSLATIONS = {
     "verify.has_mismatch": {"ko": "  >>> 불일치 항목이 있습니다! <<<", "en": "  >>> Mismatches detected! <<<"},
     "verify.mismatch_action": {"ko": "  수사관 판단으로 진행/중단을 선택해주세요.", "en": "  Investigator must decide to proceed or abort."},
     "verify.mismatch_warning": {"ko": "경고: 대조 불일치가 감지되었습니다.", "en": "Warning: Verification mismatch detected."},
+    "verify.error_badge": {"ko": "검증 오류", "en": "Verification Error"},
+    "verify.error_label": {"ko": "오류 원인", "en": "Error cause"},
+    "verify.error_title": {"ko": "검증 오류", "en": "Verification Error"},
+    "verify.error_block": {
+        "ko": "사전 검증 중 오류가 발생하여 진행할 수 없습니다.\n입력한 봉인지/암호화 파일/키를 확인해주세요.\n\n원인: {v}",
+        "en": "Pre-verification failed; cannot proceed.\nCheck the seal record, encrypted file, and key.\n\nCause: {v}",
+    },
+    "verify.error_action": {
+        "ko": "  이전 단계로 돌아가 입력을 확인한 뒤 다시 시도해주세요.",
+        "en": "  Go back to the previous step, check the inputs, and retry.",
+    },
+    "verify.error_warning": {
+        "ko": "경고: 봉인지 검증 중 오류가 발생했습니다. 진행이 차단됩니다.",
+        "en": "Warning: An error occurred during seal record verification. Progression is blocked.",
+    },
 
     # Reseal file comparison
     "reseal.file_summary": {"ko": "기존 파일: {known}개  |  Unknown 파일: {unknown}개", "en": "Known files: {known}  |  Unknown files: {unknown}"},
@@ -892,4 +942,71 @@ _TRANSLATIONS = {
 
     # Navigation
     "common.back_to_current": {"ko": "현재 단계로 →", "en": "Back to Current →"},
+
+    # Wizard busy states (Wave 2)
+    "unseal.verifying": {"ko": "파일 검증 중...", "en": "Verifying files..."},
+    "reseal.comparing": {"ko": "파일 비교 중...", "en": "Comparing files..."},
+
+    # Byte-level progress display (Wave 2)
+    "progress.bytes_label": {
+        "ko": "진행: {current} / {total}",
+        "en": "Progress: {current} / {total}",
+    },
+    "progress.speed_mb": {
+        "ko": "속도: {rate:.1f} MB/초",
+        "en": "Speed: {rate:.1f} MB/s",
+    },
+
+    # Inline validation summary (Wave 2)
+    "validate.fix_errors": {
+        "ko": "입력 오류 {count}건을 확인해주세요.",
+        "en": "Please fix {count} input error(s).",
+    },
+
+    # Summary card row labels (Wave 2)
+    "summary.seal_id": {"ko": "Seal ID", "en": "Seal ID"},
+    "summary.case_number": {"ko": "사건번호", "en": "Case No."},
+    "summary.investigator": {"ko": "담당 수사관", "en": "Investigator"},
+    "summary.rank": {"ko": "직급", "en": "Rank"},
+    "summary.subject": {"ko": "피압수자", "en": "Subject"},
+    "summary.email": {"ko": "이메일", "en": "Email"},
+    "summary.dob": {"ko": "생년월일", "en": "Date of Birth"},
+    "summary.phone": {"ko": "연락처", "en": "Phone"},
+    "summary.seizure_datetime": {"ko": "압수일시", "en": "Seizure Date"},
+    "summary.seizure_location": {"ko": "압수장소", "en": "Seizure Location"},
+    "summary.manufacturer": {"ko": "제조사", "en": "Manufacturer"},
+    "summary.model": {"ko": "모델명", "en": "Model"},
+    "summary.serial": {"ko": "시리얼 번호", "en": "Serial No."},
+    "summary.source_file": {"ko": "대상 파일", "en": "Target File"},
+    "summary.file_size": {"ko": "파일 크기", "en": "File Size"},
+    "summary.chunk_size": {"ko": "구간 크기", "en": "Chunk Size"},
+    "summary.sha256": {"ko": "SHA-256", "en": "SHA-256"},
+    "summary.md5": {"ko": "MD5", "en": "MD5"},
+    "summary.enc_file": {"ko": "암호화 파일", "en": "Encrypted File"},
+    "summary.enc_start": {"ko": "암호화 시작", "en": "Encryption Start"},
+    "summary.enc_end": {"ko": "암호화 종료", "en": "Encryption End"},
+    "summary.elapsed": {"ko": "소요 시간", "en": "Elapsed"},
+    "summary.unlock_time": {"ko": "unlock_time", "en": "unlock_time"},
+    "summary.key_shares": {"ko": "키 조각", "en": "Key Shares"},
+    "summary.reason": {"ko": "사유", "en": "Reason"},
+    "summary.participated": {"ko": "피압수자 참여", "en": "Subject Participation"},
+    "summary.output_file": {"ko": "출력 파일", "en": "Output File"},
+    "summary.hash_verified": {"ko": "해시 검증", "en": "Hash Verification"},
+    "summary.record_json": {"ko": "기록지 JSON", "en": "Record JSON"},
+    "summary.record_pdf": {"ko": "기록지 PDF", "en": "Record PDF"},
+    "summary.dec_file": {"ko": "복호화 파일", "en": "Decrypted File"},
+    "summary.known_files": {"ko": "기존 파일", "en": "Known Files"},
+    "summary.unknown_files": {"ko": "Unknown 파일", "en": "Unknown Files"},
+    "summary.derived_files": {"ko": "파생 파일", "en": "Derived Files"},
+    "summary.excluded_files": {"ko": "제외 파일", "en": "Excluded Files"},
+    "summary.enc_count": {"ko": "암호화 파일 수", "en": "Encrypted Files"},
+    "summary.history": {"ko": "절차 이력", "en": "Procedure History"},
+    "summary.summary_code": {"ko": "Summary", "en": "Summary"},
+    "summary.expected_sha256": {"ko": "기대 SHA-256", "en": "Expected SHA-256"},
+    "summary.actual_sha256": {"ko": "실제 SHA-256", "en": "Actual SHA-256"},
+    "summary.result": {"ko": "결과", "en": "Result"},
+    "summary.count_files": {"ko": "{v}개", "en": "{v} file(s)"},
+    "summary.target_dir": {"ko": "대상 폴더", "en": "Target Directory"},
+    "summary.verification": {"ko": "검증 항목", "en": "Verification Items"},
+    "summary.notice": {"ko": "안내", "en": "Notice"},
 }

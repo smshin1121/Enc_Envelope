@@ -25,9 +25,9 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_INK_COLOR = "#1a237e"
+_INK_COLOR = "#1a237e"  # ink color — intentionally fixed
 _GUIDE_COLOR = COLORS["guide_line"]
-_GUIDE_FONT = ("맑은 고딕", 16)
+_GUIDE_FONT = (FONTS["header"][0], FONTS["header"][1] + 2)
 _BASELINE_DASH = (4, 4)
 
 _SPEED_SLOW = 5.0  # px/ms threshold for slow movement
@@ -317,11 +317,26 @@ class EnhancedSignaturePad(tk.Frame):
             bg=get_color("card_bg"),
         ).pack(padx=16, pady=(16, 8))
 
+        # Scale the preview so the dialog fits on the screen even at
+        # high DPI scaling / small displays (keeps the aspect ratio).
+        try:
+            screen_w = self.winfo_screenwidth()
+            screen_h = self.winfo_screenheight()
+        except tk.TclError:
+            screen_w, screen_h = 1280, 800
+        scale = min(
+            1.0,
+            max(0.3, (screen_w - 160) / self.CANVAS_WIDTH),
+            max(0.3, (screen_h - 320) / self.CANVAS_HEIGHT),
+        )
+        preview_w = int(self.CANVAS_WIDTH * scale)
+        preview_h = int(self.CANVAS_HEIGHT * scale)
+
         # Create a preview canvas copying the current signature
         preview_canvas = tk.Canvas(
             dialog,
-            width=self.CANVAS_WIDTH,
-            height=self.CANVAS_HEIGHT,
+            width=preview_w,
+            height=preview_h,
             bg="white",
             relief="flat",
             bd=0,
@@ -330,20 +345,20 @@ class EnhancedSignaturePad(tk.Frame):
         )
         preview_canvas.pack(padx=16, pady=8)
 
-        # Redraw the baseline on preview
-        baseline_y = self.CANVAS_HEIGHT - 30
+        # Redraw the baseline on preview (scaled)
+        baseline_y = preview_h - int(30 * scale)
         preview_canvas.create_line(
-            30, baseline_y,
-            self.CANVAS_WIDTH - 30, baseline_y,
+            int(30 * scale), baseline_y,
+            preview_w - int(30 * scale), baseline_y,
             fill=_GUIDE_COLOR,
             dash=_BASELINE_DASH,
         )
 
-        # Reproduce all strokes on the preview canvas
+        # Reproduce all strokes on the preview canvas (scaled)
         for x1, y1, x2, y2 in self._lines:
             preview_canvas.create_line(
-                x1, y1, x2, y2,
-                width=2,
+                x1 * scale, y1 * scale, x2 * scale, y2 * scale,
+                width=max(1, round(2 * scale)),
                 fill=_INK_COLOR,
                 capstyle="round",
                 smooth=True,
@@ -361,7 +376,7 @@ class EnhancedSignaturePad(tk.Frame):
                 self._disable_canvas()
                 self._status_label.configure(
                     text=t("sig.confirmed"),
-                    fg=COLORS["success"],
+                    fg=COLORS["success_text"],
                 )
             except Exception:
                 pass

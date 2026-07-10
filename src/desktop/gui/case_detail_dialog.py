@@ -148,7 +148,7 @@ class CaseDetailDialog(tk.Toplevel):
         file_info = record.get("file_info", {})
 
         text = tk.Text(
-            frame, wrap="word", font=("Consolas", 9), state="normal"
+            frame, wrap="word", font=get_font("mono"), state="normal"
         )
         scroll = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
         text.configure(yscrollcommand=scroll.set)
@@ -176,9 +176,9 @@ class CaseDetailDialog(tk.Toplevel):
         else:
             events = []
 
-        canvas = tk.Canvas(frame, bg="white", highlightthickness=0)
+        canvas = tk.Canvas(frame, bg=COLORS["card_bg"], highlightthickness=0)
         scrollbar = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
-        inner = tk.Frame(canvas, bg="white")
+        inner = tk.Frame(canvas, bg=COLORS["card_bg"])
 
         inner.bind(
             "<Configure>",
@@ -188,7 +188,7 @@ class CaseDetailDialog(tk.Toplevel):
         canvas.configure(yscrollcommand=scrollbar.set)
 
         if not events:
-            tk.Label(inner, text=t("case_detail.no_history"), bg="white").pack(pady=20)
+            tk.Label(inner, text=t("case_detail.no_history"), bg=COLORS["card_bg"]).pack(pady=20)
         else:
             for idx, event in enumerate(events):
                 self._render_timeline_item(inner, idx + 1, event)
@@ -207,20 +207,20 @@ class CaseDetailDialog(tk.Toplevel):
         actor = event.get("actor", event.get("investigator", ""))
         reason = event.get("reason", "")
 
-        item = tk.Frame(parent, bg="white", padx=8, pady=4)
+        item = tk.Frame(parent, bg=COLORS["card_bg"], padx=8, pady=4)
         item.pack(fill="x", pady=2)
 
         # Timeline dot
-        dot_frame = tk.Frame(item, bg="white", width=30)
+        dot_frame = tk.Frame(item, bg=COLORS["card_bg"], width=30)
         dot_frame.pack(side="left", fill="y")
         dot_frame.pack_propagate(False)
-        color = get_color("info") if "seal" in event_type.lower() and "un" not in event_type.lower() else (
-            get_color("danger") if "un" in event_type.lower() else get_color("success")
+        color = get_color("info_text") if "seal" in event_type.lower() and "un" not in event_type.lower() else (
+            get_color("danger_text") if "un" in event_type.lower() else get_color("success_text")
         )
-        tk.Label(dot_frame, text=f"[{seq}]", fg=color, bg="white", font=get_font("small")).pack()
+        tk.Label(dot_frame, text=f"[{seq}]", fg=color, bg=COLORS["card_bg"], font=get_font("small")).pack()
 
         # Details
-        detail_frame = tk.Frame(item, bg="white")
+        detail_frame = tk.Frame(item, bg=COLORS["card_bg"])
         detail_frame.pack(side="left", fill="x", expand=True)
         time_str = start
         if end:
@@ -228,7 +228,7 @@ class CaseDetailDialog(tk.Toplevel):
         tk.Label(
             detail_frame,
             text=f"{label}    {time_str}    {actor}",
-            bg="white",
+            bg=COLORS["card_bg"],
             font=get_font("body"),
             anchor="w",
         ).pack(anchor="w")
@@ -236,7 +236,7 @@ class CaseDetailDialog(tk.Toplevel):
             tk.Label(
                 detail_frame,
                 text=f"  {t('case_detail.reason_prefix')} {reason}",
-                bg="white",
+                bg=COLORS["card_bg"],
                 font=get_font("small"),
                 fg=get_color("text_secondary"),
                 anchor="w",
@@ -267,7 +267,7 @@ class CaseDetailDialog(tk.Toplevel):
         tree.column("file_path", width=300)
 
         tree.tag_configure("odd", background=_ALT_ROW_BG)
-        tree.tag_configure("even", background="white")
+        tree.tag_configure("even", background=COLORS["card_bg"])
 
         for idx, art in enumerate(artifacts):
             path = art.get("file_path", "")
@@ -326,7 +326,7 @@ class ArtifactsWindow(tk.Toplevel):
         tree.column("file_path", width=280)
 
         tree.tag_configure("odd", background=_ALT_ROW_BG)
-        tree.tag_configure("even", background="white")
+        tree.tag_configure("even", background=COLORS["card_bg"])
 
         for idx, art in enumerate(artifacts):
             path = art.get("file_path", "")
@@ -372,9 +372,9 @@ class HistoryWindow(tk.Toplevel):
         self.grab_set()
 
     def _build(self, events: list[dict[str, Any]]) -> None:
-        canvas = tk.Canvas(self, bg="white", highlightthickness=0)
+        canvas = tk.Canvas(self, bg=COLORS["card_bg"], highlightthickness=0)
         scrollbar = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
-        inner = tk.Frame(canvas, bg="white")
+        inner = tk.Frame(canvas, bg=COLORS["card_bg"])
 
         inner.bind(
             "<Configure>",
@@ -384,7 +384,7 @@ class HistoryWindow(tk.Toplevel):
         canvas.configure(yscrollcommand=scrollbar.set)
 
         if not events:
-            tk.Label(inner, text=t("case_detail.no_history"), bg="white", font=("맑은 고딕", 11)).pack(pady=40)
+            tk.Label(inner, text=t("case_detail.no_history"), bg=COLORS["card_bg"], font=get_font("body")).pack(pady=40)
         else:
             for idx, event in enumerate(events):
                 self._render_item(inner, idx + 1, event)
@@ -404,14 +404,14 @@ class HistoryWindow(tk.Toplevel):
         actor = event.get("actor", event.get("investigator", ""))
         reason = event.get("reason", "")
 
-        item = tk.Frame(parent, bg="white", padx=12, pady=6)
+        item = tk.Frame(parent, bg=COLORS["card_bg"], padx=12, pady=6)
         item.pack(fill="x")
 
-        color = get_color("info")
+        color = get_color("info_text")
         if "un" in event_type.lower():
-            color = get_color("danger")
+            color = get_color("danger_text")
         elif "re" in event_type.lower():
-            color = get_color("success")
+            color = get_color("success_text")
 
         header = f"[{seq}] {label}"
         time_str = start
@@ -420,12 +420,12 @@ class HistoryWindow(tk.Toplevel):
         line = f"{header}    {time_str}    {actor}"
 
         tk.Label(
-            item, text=line, bg="white", font=get_font("body"), fg=color, anchor="w"
+            item, text=line, bg=COLORS["card_bg"], font=get_font("body"), fg=color, anchor="w"
         ).pack(anchor="w")
 
         if reason:
             tk.Label(
-                item, text=f"    {t('case_detail.reason_prefix')} {reason}", bg="white", font=get_font("small"),
+                item, text=f"    {t('case_detail.reason_prefix')} {reason}", bg=COLORS["card_bg"], font=get_font("small"),
                 fg=get_color("text_secondary"), anchor="w",
             ).pack(anchor="w")
 
@@ -516,4 +516,6 @@ def _try_open_folder(path: str) -> None:
 def _copy_to_clipboard(widget: tk.Widget, text: str) -> None:
     widget.clipboard_clear()
     widget.clipboard_append(text)
-    widget.update()
+    # update_idletasks() flushes the clipboard without re-entering the
+    # event loop (update() risks re-entrancy during event handling)
+    widget.update_idletasks()

@@ -3,17 +3,20 @@
 Displays statistics, quick-action cards, system status, alerts,
 and recent case history in a responsive grid layout.
 Styled per DESIGN.md Stripe-inspired design system.
+
+DB queries run on a background worker thread; results are marshalled
+back to the Tk main loop via ``after()`` so the UI never freezes.
 """
 
 from __future__ import annotations
 
-import json
 import logging
+import queue
 import sqlite3
+import threading
 import tkinter as tk
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from .i18n import t
 from .theme import COLORS, FONTS, SPACING, get_color, get_font, get_spacing
@@ -34,6 +37,15 @@ class Dashboard(tk.Frame):
     def __init__(self, master: tk.Widget, app: Any, **kwargs: Any) -> None:
         super().__init__(master, **kwargs)
         self._app = app
+        self._loading = False
+        # Thread-safe channel: worker threads put results here and the Tk
+        # main loop polls it (after() is not safe to call off-thread).
+        self._result_queue: queue.Queue = queue.Queue()
+        self._poll_after_id: Optional[str] = None
+        # Cancel any pending poll timer on destroy — otherwise the timer
+        # fires after the widget's Tcl command is deleted and Tk prints
+        # an "invalid command name" background error.
+        self.bind("<Destroy>", self._cancel_poll, add="+")
         self.configure(bg=get_color("bg"))
 
         self.columnconfigure(0, weight=3)
@@ -50,17 +62,16 @@ class Dashboard(tk.Frame):
         self.refresh()
 
     # ------------------------------------------------------------------
-    # Title — white header with bottom border (DESIGN.md Navigation Header)
+    # Title — deep navy header (DESIGN.md Navigation Header)
     # ------------------------------------------------------------------
 
     def _build_title(self, row: int) -> None:
-        # Deep navy header for strong visual contrast
-        _header_bg = "#061b31"
-        title_frame = tk.Frame(self, bg=_header_bg)
+        header_bg = get_color("header_bg")
+        title_frame = tk.Frame(self, bg=header_bg)
         title_frame.grid(row=row, column=0, columnspan=2, sticky="ew",
                          padx=0, pady=0)
 
-        inner = tk.Frame(title_frame, bg=_header_bg, height=56)
+        inner = tk.Frame(title_frame, bg=header_bg, height=56)
         inner.pack(fill="x")
         inner.pack_propagate(False)
 
@@ -68,20 +79,20 @@ class Dashboard(tk.Frame):
             inner,
             text=t("dashboard.title"),
             font=get_font("title"),
-            fg="#ffffff",
-            bg=_header_bg,
+            fg=get_color("header_fg"),
+            bg=header_bg,
         ).pack(side="left", padx=get_spacing("lg"), pady=0)
 
         self._refresh_btn = tk.Button(
             inner,
             text=t("dashboard.refresh"),
             font=get_font("small"),
-            command=self.refresh,
+            command=self._on_manual_refresh,
             relief="flat",
-            bg=_header_bg,
-            fg="#a8c4e0",
-            activebackground="#0d2a47",
-            activeforeground="#ffffff",
+            bg=header_bg,
+            fg=get_color("header_fg_muted"),
+            activebackground=get_color("header_hover_bg"),
+            activeforeground=get_color("header_fg"),
             cursor="hand2",
             bd=0,
         )
@@ -147,7 +158,7 @@ class Dashboard(tk.Frame):
             ).pack(pady=(0, get_spacing("xs")))
 
     # ------------------------------------------------------------------
-    # Quick action cards (2x2 grid) — white bg, border, hover effects
+    # Quick action cards (2x2 grid) — white bg, border, hover/focus effects
     # ------------------------------------------------------------------
 
     def _build_quick_actions(self, row: int) -> None:
@@ -181,17 +192,26 @@ class Dashboard(tk.Frame):
         grid_row: int,
         grid_col: int,
     ) -> None:
-        # Color mapping for left bar
+        # Left accent bar color from theme tokens
         _action_colors = {
-            "seal": "#3366cc",
-            "unseal": "#1a5276",
-            "reseal": "#1e8e4e",
-            "info": "#7c3aed",
+            "seal": get_color("accent_seal"),
+            "unseal": get_color("accent_unseal"),
+            "reseal": get_color("accent_reseal"),
+            "info": get_color("accent_info"),
         }
         bar_color = _action_colors.get(color_key, get_color("primary"))
 
-        # Shadow wrapper
-        shadow = tk.Frame(parent, bg=get_color("shadow"), cursor="hand2")
+        # Shadow wrapper — also the keyboard-focusable element with a
+        # visible focus ring (highlightcolor shows when focused)
+        shadow = tk.Frame(
+            parent,
+            bg=get_color("shadow"),
+            cursor="hand2",
+            takefocus=1,
+            highlightthickness=2,
+            highlightbackground=get_color("bg"),
+            highlightcolor=get_color("primary"),
+        )
         shadow.grid(row=grid_row, column=grid_col, sticky="nsew",
                     padx=get_spacing("xs"), pady=get_spacing("xs"))
 
@@ -229,22 +249,31 @@ class Dashboard(tk.Frame):
         hover_bg = get_color("hover")
         normal_bg = get_color("card_bg")
 
+        def _set_bg(color: str) -> None:
+            card.configure(bg=color)
+            inner.configure(bg=color)
+            title_label.configure(bg=color)
+            desc_label.configure(bg=color)
+
         def _on_enter(_e: tk.Event) -> None:  # type: ignore[type-arg]
-            card.configure(bg=hover_bg)
-            inner.configure(bg=hover_bg)
-            title_label.configure(bg=hover_bg)
-            desc_label.configure(bg=hover_bg)
+            _set_bg(hover_bg)
 
         def _on_leave(_e: tk.Event) -> None:  # type: ignore[type-arg]
-            card.configure(bg=normal_bg)
-            inner.configure(bg=normal_bg)
-            title_label.configure(bg=normal_bg)
-            desc_label.configure(bg=normal_bg)
+            _set_bg(normal_bg)
+
+        def _activate(_e: tk.Event) -> None:  # type: ignore[type-arg]
+            callback()
 
         for widget in (shadow, card, inner, title_label, desc_label, color_bar):
             widget.bind("<Enter>", _on_enter)
             widget.bind("<Leave>", _on_leave)
-            widget.bind("<Button-1>", lambda _e, cb=callback: cb())
+            widget.bind("<Button-1>", _activate)
+
+        # Keyboard access: focus ring + Return/Space activation
+        shadow.bind("<FocusIn>", _on_enter)
+        shadow.bind("<FocusOut>", _on_leave)
+        shadow.bind("<Return>", _activate)
+        shadow.bind("<space>", _activate)
 
     # ------------------------------------------------------------------
     # System status + alerts (right panel) — card style
@@ -263,15 +292,15 @@ class Dashboard(tk.Frame):
         panel.pack(fill="both", expand=True, padx=(0, 3), pady=(0, 3))
 
         # System status header with dark accent
-        status_header = tk.Frame(panel, bg="#061b31", height=36)
+        status_header = tk.Frame(panel, bg=get_color("header_bg"), height=36)
         status_header.pack(fill="x")
         status_header.pack_propagate(False)
         tk.Label(
             status_header,
             text=t("dashboard.system_status"),
             font=get_font("header"),
-            fg="#ffffff",
-            bg="#061b31",
+            fg=get_color("header_fg"),
+            bg=get_color("header_bg"),
             anchor="w",
         ).pack(fill="x", padx=get_spacing("md"), pady=get_spacing("xs"))
 
@@ -314,15 +343,15 @@ class Dashboard(tk.Frame):
         self._key_status_label.pack(side="left", fill="x")
 
         # Alerts header with accent
-        alerts_header = tk.Frame(panel, bg="#3d1a54", height=36)
+        alerts_header = tk.Frame(panel, bg=get_color("notice_header"), height=36)
         alerts_header.pack(fill="x")
         alerts_header.pack_propagate(False)
         tk.Label(
             alerts_header,
             text=t("dashboard.alerts"),
             font=get_font("header"),
-            fg="#ffffff",
-            bg="#3d1a54",
+            fg=get_color("header_fg"),
+            bg=get_color("notice_header"),
             anchor="w",
         ).pack(fill="x", padx=get_spacing("md"), pady=get_spacing("xs"))
 
@@ -331,7 +360,7 @@ class Dashboard(tk.Frame):
                                padx=get_spacing("md"), pady=(get_spacing("xs"), get_spacing("md")))
 
     # ------------------------------------------------------------------
-    # Recent history (bottom) — card style with row separators
+    # Recent history (bottom) — grid-aligned table with i18n headers
     # ------------------------------------------------------------------
 
     def _build_recent_history(self, row: int) -> None:
@@ -344,53 +373,317 @@ class Dashboard(tk.Frame):
         history_frame.pack(fill="both", expand=True, padx=(0, 3), pady=(0, 3))
 
         # Dark header for recent activity
-        hist_header = tk.Frame(history_frame, bg="#061b31", height=36)
+        hist_header = tk.Frame(history_frame, bg=get_color("header_bg"), height=36)
         hist_header.pack(fill="x")
         hist_header.pack_propagate(False)
         tk.Label(
             hist_header,
             text=t("dashboard.recent_activity"),
             font=get_font("header"),
-            fg="#ffffff",
-            bg="#061b31",
+            fg=get_color("header_fg"),
+            bg=get_color("header_bg"),
             anchor="w",
         ).pack(fill="x", padx=get_spacing("md"), pady=get_spacing("xs"))
 
-        # Table header row
-        header_row = tk.Frame(history_frame, bg=get_color("bg"))
-        header_row.pack(fill="x")
+        # Grid table (header + data rows share the same grid columns)
+        self._history_table = tk.Frame(history_frame, bg=get_color("card_bg"))
+        self._history_table.pack(fill="both", expand=True)
+        self._history_table.columnconfigure(0, weight=0, minsize=170)
+        self._history_table.columnconfigure(1, weight=0, minsize=110)
+        self._history_table.columnconfigure(2, weight=1)
+
+        self._render_history_placeholder(t("dashboard.loading"))
+
+    def _render_history_header(self) -> int:
+        """Render the column header row; returns the next free grid row."""
+        header_bg = get_color("bg")
+        for col, key in enumerate(
+            ("dashboard.col_time", "dashboard.col_type", "dashboard.col_seal_id")
+        ):
+            tk.Label(
+                self._history_table,
+                text=t(key),
+                font=get_font("caption"),
+                fg=get_color("text_secondary"),
+                bg=header_bg,
+                anchor="w",
+                padx=get_spacing("sm"),
+                pady=4,
+            ).grid(row=0, column=col, sticky="ew")
+
+        sep = tk.Frame(self._history_table, height=1, bg=get_color("border"))
+        sep.grid(row=1, column=0, columnspan=3, sticky="ew")
+        return 2
+
+    def _clear_history_table(self) -> None:
+        for child in self._history_table.winfo_children():
+            child.destroy()
+
+    def _render_history_placeholder(self, text: str) -> None:
+        self._clear_history_table()
+        self._render_history_header()
         tk.Label(
-            header_row,
-            text="  TIME                |  TYPE        |  SEAL ID",
-            font=get_font("mono"),
+            self._history_table,
+            text=text,
+            font=get_font("body"),
             fg=get_color("text_secondary"),
-            bg=get_color("bg"),
-            anchor="w",
+            bg=get_color("card_bg"),
+        ).grid(row=2, column=0, columnspan=3, pady=get_spacing("md"))
+
+    def _render_history_empty_state(self) -> None:
+        """Empty state with guidance text and a call-to-action button."""
+        self._clear_history_table()
+        self._render_history_header()
+
+        tk.Label(
+            self._history_table,
+            text=t("dashboard.no_activity"),
+            font=get_font("subheader"),
+            fg=get_color("text_secondary"),
+            bg=get_color("card_bg"),
+        ).grid(row=2, column=0, columnspan=3, pady=(get_spacing("md"), 2))
+        tk.Label(
+            self._history_table,
+            text=t("dashboard.no_activity_hint"),
+            font=get_font("small"),
+            fg=get_color("text_secondary"),
+            bg=get_color("card_bg"),
+        ).grid(row=3, column=0, columnspan=3)
+        tk.Button(
+            self._history_table,
+            text=t("dashboard.empty_cta"),
+            command=self._app._on_seal,
+            font=get_font("button"),
+            fg=get_color("text_light"),
+            bg=get_color("primary"),
+            activebackground=get_color("primary_hover"),
+            activeforeground=get_color("text_light"),
+            relief="flat",
+            bd=0,
+            padx=get_spacing("md"),
             pady=4,
-        ).pack(fill="x")
+            cursor="hand2",
+        ).grid(row=4, column=0, columnspan=3, pady=get_spacing("sm"))
 
-        sep = tk.Frame(history_frame, height=1, bg=get_color("border"))
-        sep.pack(fill="x")
+    def _render_history_rows(self, cases: list[dict]) -> None:
+        self._clear_history_table()
+        next_row = self._render_history_header()
 
-        self._history_list = tk.Frame(history_frame, bg=get_color("card_bg"))
-        self._history_list.pack(fill="both", expand=True, padx=0, pady=0)
-        self._history_row_count = 0
+        for idx, case in enumerate(cases):
+            self._add_history_row(case, idx, next_row + idx)
+
+    def _add_history_row(self, case: dict, row_idx: int, grid_row: int) -> None:
+        normal_bg = (
+            get_color("card_bg") if row_idx % 2 == 0 else get_color("bg")
+        )
+        created = case.get("created_at", "")
+        status = case.get("status", "")
+        seal_id = case.get("seal_id", "")
+        type_text = _status_to_type(status)
+
+        cells: list[tk.Label] = []
+        for col, text in enumerate((created, type_text, seal_id)):
+            label = tk.Label(
+                self._history_table,
+                text=text,
+                font=get_font("body"),
+                fg=get_color("text"),
+                bg=normal_bg,
+                anchor="w",
+                padx=get_spacing("sm"),
+                pady=5,
+                cursor="hand2",
+            )
+            label.grid(row=grid_row, column=col, sticky="ew")
+            cells.append(label)
+
+        # First cell carries keyboard focus for the whole row
+        focus_cell = cells[0]
+        focus_cell.configure(
+            takefocus=1,
+            highlightthickness=1,
+            highlightbackground=normal_bg,
+            highlightcolor=get_color("primary"),
+        )
+
+        hover_bg = get_color("hover")
+
+        def _set_bg(color: str) -> None:
+            for cell in cells:
+                cell.configure(bg=color)
+
+        def _on_enter(_e: tk.Event) -> None:  # type: ignore[type-arg]
+            _set_bg(hover_bg)
+
+        def _on_leave(_e: tk.Event) -> None:  # type: ignore[type-arg]
+            _set_bg(normal_bg)
+
+        def _activate(_e: tk.Event) -> None:  # type: ignore[type-arg]
+            self._open_case_detail(seal_id)
+
+        for cell in cells:
+            cell.bind("<Enter>", _on_enter)
+            cell.bind("<Leave>", _on_leave)
+            cell.bind("<Button-1>", _activate)
+
+        focus_cell.bind("<FocusIn>", _on_enter)
+        focus_cell.bind("<FocusOut>", _on_leave)
+        focus_cell.bind("<Return>", _activate)
+        focus_cell.bind("<space>", _activate)
+
+    def _open_case_detail(self, seal_id: str) -> None:
+        try:
+            from .case_detail_dialog import CaseDetailDialog
+            CaseDetailDialog(self, self._app.db_path, seal_id)
+        except Exception as exc:
+            logger.warning("케이스 상세 열기 실패: %s", exc)
 
     # ------------------------------------------------------------------
-    # Refresh / data loading
+    # Refresh / data loading (async)
     # ------------------------------------------------------------------
 
-    def refresh(self) -> None:
-        """Reload all dashboard data from the database."""
-        self._refresh_stats()
-        self._refresh_system_status()
-        self._refresh_alerts()
-        self._refresh_history()
+    def _on_manual_refresh(self) -> None:
+        """Handle the manual refresh button — refresh with a toast on done."""
+        self.refresh(notify=True)
 
-    def _refresh_stats(self) -> None:
-        from ..db.sqlite_store import get_dashboard_stats
+    def refresh(self, *, notify: bool = False) -> None:
+        """Reload dashboard data on a worker thread and update the UI.
 
-        stats = get_dashboard_stats(self._app.db_path)
+        Args:
+            notify: When True, show a toast once the refresh completes.
+        """
+        if self._loading:
+            return
+        self._loading = True
+        self._show_loading_state()
+
+        worker = threading.Thread(
+            target=self._load_data_worker,
+            args=(notify,),
+            daemon=True,
+            name="dashboard-refresh",
+        )
+        worker.start()
+        self._poll_worker_result()
+
+    def _poll_worker_result(self) -> None:
+        """Poll the result queue from the Tk main loop (thread-safe)."""
+        self._poll_after_id = None
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+
+        try:
+            data, notify = self._result_queue.get_nowait()
+        except queue.Empty:
+            self._poll_after_id = self.after(100, self._poll_worker_result)
+            return
+
+        self._apply_data(data, notify)
+
+    def _cancel_poll(self, _event: "tk.Event | None" = None) -> None:
+        """Cancel the pending poll timer (bound to <Destroy>)."""
+        if self._poll_after_id is not None:
+            try:
+                self.after_cancel(self._poll_after_id)
+            except tk.TclError:
+                pass
+            self._poll_after_id = None
+
+    def _show_loading_state(self) -> None:
+        """Show subtle loading placeholders while data is being fetched."""
+        for label in self._stat_labels.values():
+            label.configure(text="…")
+        self._render_history_placeholder(t("dashboard.loading"))
+
+    def _load_data_worker(self, notify: bool) -> None:
+        """Run all DB queries off the main thread; deliver via after()."""
+        data: dict[str, Any] = {
+            "stats": None,
+            "db_ok": False,
+            "key_exists": False,
+            "expiring": [],
+            "cases": [],
+        }
+
+        db_path = self._app.db_path
+
+        # DB connectivity check
+        if db_path:
+            try:
+                conn = sqlite3.connect(db_path)
+                try:
+                    conn.execute("SELECT 1")
+                finally:
+                    conn.close()
+                data["db_ok"] = True
+            except Exception:
+                data["db_ok"] = False
+
+        # Statistics
+        if data["db_ok"]:
+            try:
+                from ..db.sqlite_store import get_dashboard_stats
+                data["stats"] = get_dashboard_stats(db_path)
+            except Exception as exc:
+                logger.warning("대시보드 통계 조회 실패: %s", exc)
+
+            try:
+                from ..db.sqlite_store import get_expiring_seals
+                data["expiring"] = get_expiring_seals(db_path, days=3)
+            except Exception as exc:
+                logger.warning("만료 임박 조회 실패: %s", exc)
+
+            try:
+                from ..db.sqlite_store import get_recent_cases
+                data["cases"] = get_recent_cases(db_path, limit=5)
+            except Exception as exc:
+                logger.warning("최근 이력 조회 실패: %s", exc)
+
+        # Master key check
+        try:
+            data["key_exists"] = (
+                Path.home() / ".enc_envelope" / "master.key"
+            ).exists()
+        except Exception:
+            data["key_exists"] = False
+
+        # Hand off to the Tk main loop via the polled queue (thread-safe)
+        self._result_queue.put((data, notify))
+
+    def _apply_data(self, data: dict[str, Any], notify: bool) -> None:
+        """Apply worker results to the UI (main thread only)."""
+        self._loading = False
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+
+        self._apply_stats(data.get("stats"))
+        self._apply_system_status(
+            db_ok=bool(data.get("db_ok")),
+            key_exists=bool(data.get("key_exists")),
+        )
+        self._apply_alerts(data.get("expiring") or [])
+        self._apply_history(data.get("cases") or [])
+
+        if notify:
+            toasts = getattr(self._app, "toasts", None)
+            if toasts is not None:
+                toasts.show(
+                    self._app.root, t("dashboard.refresh_done"),
+                    toast_type="info",
+                )
+
+    def _apply_stats(self, stats: Optional[dict]) -> None:
+        if stats is None:
+            na = t("dashboard.stat_na")
+            for label in self._stat_labels.values():
+                label.configure(text=na)
+            return
         self._stat_labels["seal_count"].configure(text=str(stats.get("sealed_only", 0)))
         self._stat_labels["unseal_count"].configure(text=str(stats.get("unsealed", 0)))
         self._stat_labels["reseal_count"].configure(text=str(stats.get("resealed", 0)))
@@ -400,18 +693,7 @@ class Dashboard(tk.Frame):
         canvas.delete("all")
         canvas.create_oval(0, 0, 12, 12, fill=color, outline=color)
 
-    def _refresh_system_status(self) -> None:
-        # DB connection check
-        db_ok = False
-        if self._app.db_path:
-            try:
-                conn = sqlite3.connect(self._app.db_path)
-                conn.execute("SELECT 1")
-                conn.close()
-                db_ok = True
-            except Exception:
-                pass
-
+    def _apply_system_status(self, *, db_ok: bool, key_exists: bool) -> None:
         if db_ok:
             self._draw_status_dot(self._db_dot, get_color("success"))
             self._db_status_label.configure(
@@ -422,12 +704,10 @@ class Dashboard(tk.Frame):
             self._draw_status_dot(self._db_dot, get_color("danger"))
             self._db_status_label.configure(
                 text=f"{t('dashboard.db_status')}: {t('dashboard.db_fail')}",
-                fg=get_color("danger"),
+                fg=get_color("danger_text"),
             )
 
-        # Master key check
-        key_path = Path.home() / ".enc_envelope" / "master.key"
-        if key_path.exists():
+        if key_exists:
             self._draw_status_dot(self._key_dot, get_color("success"))
             self._key_status_label.configure(
                 text=f"{t('dashboard.master_key')}: {t('dashboard.key_exists')}",
@@ -437,23 +717,19 @@ class Dashboard(tk.Frame):
             self._draw_status_dot(self._key_dot, get_color("danger"))
             self._key_status_label.configure(
                 text=f"{t('dashboard.master_key')}: {t('dashboard.key_missing')}",
-                fg=get_color("danger"),
+                fg=get_color("danger_text"),
             )
 
-    def _refresh_alerts(self) -> None:
+    def _apply_alerts(self, expiring: list[dict]) -> None:
         for child in self._alert_frame.winfo_children():
             child.destroy()
-
-        from ..db.sqlite_store import get_expiring_seals
-
-        expiring = get_expiring_seals(self._app.db_path, days=3)
 
         if not expiring:
             tk.Label(
                 self._alert_frame,
-                text=f"\u2714 {t('dashboard.no_alerts')}",
+                text=f"✔ {t('dashboard.no_alerts')}",
                 font=get_font("body"),
-                fg=get_color("success"),
+                fg=get_color("success_text"),
                 bg=get_color("panel_bg"),
                 anchor="w",
             ).pack(fill="x")
@@ -469,88 +745,20 @@ class Dashboard(tk.Frame):
             alert_inner.pack(fill="x", padx=(3, 0))  # 3px left ruby border
             tk.Label(
                 alert_inner,
-                text=f"\u26a0 {seal_id} \u2014 {t('dashboard.expiring_seal')}: {unlock_str}",
+                text=f"⚠ {seal_id} — {t('dashboard.expiring_seal')}: {unlock_str}",
                 font=get_font("small"),
-                fg=get_color("warning"),
+                fg=get_color("warning_text"),
                 bg=get_color("card_bg"),
                 anchor="w",
                 padx=get_spacing("xs"),
                 pady=2,
             ).pack(fill="x")
 
-    def _refresh_history(self) -> None:
-        self._history_row_count = 0
-        for child in self._history_list.winfo_children():
-            child.destroy()
-
-        from ..db.sqlite_store import get_recent_cases
-
-        cases = get_recent_cases(self._app.db_path, limit=5)
-
+    def _apply_history(self, cases: list[dict]) -> None:
         if not cases:
-            tk.Label(
-                self._history_list,
-                text=t("dashboard.no_activity"),
-                font=get_font("body"),
-                fg=get_color("text_secondary"),
-                bg=get_color("card_bg"),
-            ).pack(pady=get_spacing("sm"))
+            self._render_history_empty_state()
             return
-
-        for case in cases:
-            self._add_history_row(case)
-
-    def _add_history_row(self, case: dict) -> None:
-        # Alternating row background
-        row_idx = getattr(self, "_history_row_count", 0)
-        self._history_row_count = row_idx + 1
-        normal_bg = "#ffffff" if row_idx % 2 == 0 else "#f8f9fb"
-
-        row_frame = tk.Frame(self._history_list, bg=normal_bg,
-                             cursor="hand2")
-        row_frame.pack(fill="x")
-
-        created = case.get("created_at", "")
-        status = case.get("status", "")
-        seal_id = case.get("seal_id", "")
-
-        type_text = _status_to_type(status)
-
-        label = tk.Label(
-            row_frame,
-            text=f"  {created}  |  {type_text}  |  {seal_id}",
-            font=get_font("mono"),
-            fg=get_color("text"),
-            bg=normal_bg,
-            anchor="w",
-            pady=5,
-        )
-        label.pack(fill="x")
-
-        hover_bg = get_color("hover")
-
-        def _on_enter(_e: tk.Event) -> None:  # type: ignore[type-arg]
-            row_frame.configure(bg=hover_bg)
-            label.configure(bg=hover_bg)
-
-        def _on_leave(_e: tk.Event) -> None:  # type: ignore[type-arg]
-            row_frame.configure(bg=normal_bg)
-            label.configure(bg=normal_bg)
-
-        def _on_click(_e: tk.Event) -> None:  # type: ignore[type-arg]
-            self._open_case_detail(seal_id)
-
-        for widget in (row_frame, label):
-            widget.bind("<Enter>", _on_enter)
-            widget.bind("<Leave>", _on_leave)
-            widget.bind("<Button-1>", _on_click)
-
-    def _open_case_detail(self, seal_id: str) -> None:
-        try:
-            from .case_detail_dialog import CaseDetailDialog
-            CaseDetailDialog(self, self._app.db_path, seal_id)
-        except Exception as exc:
-            logger.warning("케이스 상세 열기 실패: %s", exc)
+        self._render_history_rows(cases)
 
 
 # ------------------------------------------------------------------

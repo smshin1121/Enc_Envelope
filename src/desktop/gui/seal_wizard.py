@@ -20,9 +20,16 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from .i18n import t
 from .step_indicator import StepIndicator
-from .theme import COLORS, FONTS, get_color, get_font
+from .theme import FONTS, get_color, get_font
 from .signature_pad import EnhancedSignaturePad
-from .widgets import DateEntry, FileSelector, LabeledEntry, SignaturePad
+from .widgets import (
+    DateEntry,
+    FileSelector,
+    LabeledEntry,
+    ScrolledFrame,
+    SummaryView,
+    is_return_navigation_safe,
+)
 
 if TYPE_CHECKING:
     from .app import MainApp
@@ -38,6 +45,11 @@ DEFAULT_CHUNK_GB = 64
 MIN_UNLOCK_DAYS = 1
 MAX_UNLOCK_DAYS = 30
 DEFAULT_UNLOCK_DAYS = 10
+
+
+def _clean_multiline(text: str) -> str:
+    """Strip per-line indentation from an i18n multiline message."""
+    return "\n".join(line.strip() for line in text.splitlines()).strip()
 
 
 class SealWizard(tk.Frame):
@@ -65,6 +77,9 @@ class SealWizard(tk.Frame):
         self._prefill_data = prefill_data
         self._current_step = 0
         self._data: dict[str, Any] = {}
+        self._busy = False
+        # Active ProgressDialog (encryption) — joined before cleanup.
+        self._active_dialog: Optional[Any] = None
 
         # Pre-set seal_id if provided by case workflow
         if prefill_data and prefill_data.get("seal_id"):
@@ -84,27 +99,25 @@ class SealWizard(tk.Frame):
 
     def _build_layout(self) -> None:
         """Create the outer layout: header, step indicator, content area, nav bar."""
-        from .theme import COLORS
-
-        # Header — dark blue background for seal process
-        _seal_header_bg = "#2c3e50"
-        self._header = tk.Frame(self, bg=_seal_header_bg, height=56)
+        # Header — process-colored banner (theme token)
+        header_bg = get_color("wizard_header_seal")
+        self._header = tk.Frame(self, bg=header_bg, height=56)
         self._header.pack(fill="x")
         self._header.pack_propagate(False)
 
         self._title_label = tk.Label(
             self._header,
             text=t("seal.title"),
-            fg="#ffffff",
-            bg=_seal_header_bg,
+            fg=get_color("header_fg"),
+            bg=header_bg,
             font=get_font("title"),
         )
         self._title_label.pack(side="left", padx=16)
         self._step_label = tk.Label(
             self._header,
             text="",
-            fg="#a8c4e0",
-            bg=_seal_header_bg,
+            fg=get_color("header_fg_muted"),
+            bg=header_bg,
             font=get_font("body"),
         )
         self._step_label.pack(side="right", padx=16)
@@ -138,21 +151,32 @@ class SealWizard(tk.Frame):
             activeforeground=get_color("danger"),
             relief="solid",
             bd=1,
-            font=("맑은 고딕", 11, "bold"),
+            font=get_font("button"),
             padx=12, pady=6,
         )
         self._cancel_btn.pack(side="left")
+
+        # Inline validation / busy message (replaces popup error lists)
+        self._nav_msg_label = tk.Label(
+            nav_inner,
+            text="",
+            fg=get_color("danger_text"),
+            bg=get_color("card_bg"),
+            font=get_font("small"),
+            anchor="w",
+        )
+        self._nav_msg_label.pack(side="left", padx=(12, 0))
 
         # Next button — prominent purple
         self._next_btn = tk.Button(
             nav_inner, text=t("common.next"), width=12,
             command=self._go_next,
-            fg="#ffffff",
+            fg=get_color("text_light"),
             bg=get_color("primary"),
             activebackground=get_color("primary_hover"),
-            activeforeground="white",
+            activeforeground=get_color("text_light"),
             relief="flat",
-            font=("맑은 고딕", 13, "bold"),
+            font=(FONTS["button"][0], FONTS["button"][1] + 2, "bold"),
             padx=16, pady=6,
         )
         self._next_btn.pack(side="right")
@@ -167,7 +191,7 @@ class SealWizard(tk.Frame):
             activeforeground=get_color("primary"),
             relief="solid",
             bd=1,
-            font=("맑은 고딕", 11, "bold"),
+            font=get_font("button"),
             padx=12, pady=6,
         )
         self._prev_btn.pack(side="right", padx=(0, 8))
@@ -176,29 +200,107 @@ class SealWizard(tk.Frame):
         self._content = tk.Frame(self, bg=get_color("bg"), padx=24, pady=16)
         self._content.pack(fill="both", expand=True)
 
-        # Keyboard shortcuts — skip if focus is inside an Entry widget
-        self.winfo_toplevel().bind("<Return>", self._on_return_key)
-        self.winfo_toplevel().bind("<Escape>", lambda _e: self._handle_cancel())
+        # Keyboard shortcuts on the toplevel.  Previous bindings are
+        # preserved and restored when the wizard is destroyed so a
+        # stale callback is never invoked after returning home.
+        top = self.winfo_toplevel()
+        self._bound_toplevel = top
+        self._saved_return_binding = top.bind("<Return>")
+        self._saved_escape_binding = top.bind("<Escape>")
+        self._return_funcid = top.bind("<Return>", self._on_return_key)
+        self._escape_funcid = top.bind("<Escape>", self._on_escape_key)
+        self.bind("<Destroy>", self._on_destroy, add="+")
+
+    def _on_destroy(self, event: tk.Event) -> None:  # type: ignore[type-arg]
+        """Restore the toplevel key bindings captured at build time."""
+        if event.widget is not self:
+            return
+        self._cleanup_partial_encryption()
+        try:
+            top = self._bound_toplevel
+            if top.winfo_exists():
+                # 자신이 설치한 바인딩일 때만 복원 — 새 위자드가 이미
+                # 자신의 바인딩을 설치했다면 덮어쓰지 않는다.
+                current = top.bind("<Return>") or ""
+                if self._return_funcid and self._return_funcid in current:
+                    top.bind("<Return>", self._saved_return_binding or "")
+                current = top.bind("<Escape>") or ""
+                if self._escape_funcid and self._escape_funcid in current:
+                    top.bind("<Escape>", self._saved_escape_binding or "")
+        except tk.TclError:
+            pass
+
+    def _cleanup_partial_encryption(self) -> None:
+        """Remove partial .enc / .enc.progress left by an unfinished run.
+
+        Called when the wizard is destroyed before encryption completed.
+        At that point the session AES key is lost, so the partial output
+        can never be resumed and must not linger as a stale artifact.
+        A completed encryption (``encryption_done``) is never touched.
+        Deletion failures are logged only.
+
+        Before deleting, the encryption worker (if any) is cancelled and
+        joined — deleting while the worker holds the file open causes a
+        Windows sharing violation, or the worker could recreate the file
+        right after deletion.
+        """
+        import os
+        if self._data.get("encryption_done"):
+            return
+        enc_path = self._data.get("enc_path_pending") or self._data.get("enc_path")
+        if not enc_path:
+            return
+
+        dlg = self._active_dialog
+        if dlg is not None and not dlg.cancel_and_join(timeout=5.0):
+            logger.warning(
+                "암호화 워커 종료 대기 실패 — 부분 산출물 삭제를 건너뜁니다."
+            )
+            return
+        for path in (enc_path, enc_path + ".progress"):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError as exc:
+                logger.warning("부분 암호화 산출물 삭제 실패: %s (%s)", path, exc)
+
+    def _set_nav_message(self, text: str, *, kind: str = "error") -> None:
+        """Show an inline message in the nav bar (empty text clears it)."""
+        color = get_color("danger_text") if kind == "error" else get_color("text_secondary")
+        try:
+            self._nav_msg_label.configure(text=text, fg=color)
+        except tk.TclError:
+            pass
 
     # ------------------------------------------------------------------
     # Step builders
     # ------------------------------------------------------------------
 
     def _build_steps(self) -> None:
-        """Build all 7 step frames."""
-        builders = [
-            self._build_s1,
-            self._build_s2,
-            self._build_s3,
-            self._build_s4,
-            self._build_s5,
-            self._build_s6,
-            self._build_s7,
+        """Build all 7 step frames.
+
+        Form steps are wrapped in a shared ScrolledFrame so content is
+        reachable on small windows / enlarged fonts; summary steps use
+        their own internally-scrolling SummaryView.
+        """
+        plans: list[tuple[Callable[[tk.Frame], None], bool]] = [
+            (self._build_s1, True),
+            (self._build_s2, True),
+            (self._build_s3, True),
+            (self._build_s4, False),
+            (self._build_s5, False),
+            (self._build_s6, True),
+            (self._build_s7, False),
         ]
-        for builder in builders:
-            frame = tk.Frame(self._content)
-            builder(frame)
-            self._steps.append(frame)
+        for builder, wrap in plans:
+            if wrap:
+                holder = ScrolledFrame(self._content, bg=get_color("bg"))
+                builder(holder.body)
+                self._steps.append(holder)
+            else:
+                frame = tk.Frame(self._content, bg=get_color("bg"))
+                builder(frame)
+                self._steps.append(frame)
 
     def _apply_prefill(self) -> None:
         """Apply prefill data from case workflow to S2 and S3 fields."""
@@ -226,7 +328,7 @@ class SealWizard(tk.Frame):
         tk.Label(
             parent,
             text=t("seal.s1_title"),
-            font=("맑은 고딕", 12, "bold"),
+            font=get_font("subheader"),
         ).pack(anchor="w", pady=(0, 12))
 
         self._file_selector = FileSelector(
@@ -270,24 +372,44 @@ class SealWizard(tk.Frame):
         self._validators.append(self._validate_s1)
 
     def _validate_s1(self) -> bool:
-        errors: list[str] = []
+        messages: list[str] = []
+        focus_target: Optional[tk.Widget] = None
+
         if not self._file_selector.is_valid():
-            errors.append(t("validate.select_file"))
+            self._file_selector.highlight_error(t("validate.select_file"))
+            messages.append(t("validate.select_file"))
+            focus_target = focus_target or self._file_selector.browse_btn
+        else:
+            self._file_selector.clear_error()
+
         if not self._output_selector.is_valid():
-            errors.append(t("validate.select_output"))
+            self._output_selector.highlight_error(t("validate.select_output"))
+            messages.append(t("validate.select_output"))
+            focus_target = focus_target or self._output_selector.browse_btn
+        else:
+            self._output_selector.clear_error()
+
         try:
             chunk = self._chunk_var.get()
             if not (MIN_CHUNK_GB <= chunk <= MAX_CHUNK_GB):
-                errors.append(t("validate.chunk_range").format(min=MIN_CHUNK_GB, max=MAX_CHUNK_GB))
+                messages.append(
+                    t("validate.chunk_range").format(min=MIN_CHUNK_GB, max=MAX_CHUNK_GB)
+                )
+                focus_target = focus_target or self._chunk_spin
         except (tk.TclError, ValueError):
-            errors.append(t("validate.chunk_invalid"))
-        if errors:
-            messagebox.showwarning(
-                t("common.input_error"),
-                "\n".join(errors),
-                parent=self.winfo_toplevel(),
-            )
+            messages.append(t("validate.chunk_invalid"))
+            focus_target = focus_target or self._chunk_spin
+
+        if messages:
+            summary = messages[0] if len(messages) == 1 else t(
+                "validate.fix_errors"
+            ).format(count=len(messages))
+            self._set_nav_message(summary)
+            if focus_target is not None:
+                focus_target.focus_set()
             return False
+
+        self._set_nav_message("")
         self._data["source_file"] = self._file_selector.get()
         self._data["output_dir"] = self._output_selector.get()
         self._data["chunk_size_gb"] = self._chunk_var.get()
@@ -301,7 +423,7 @@ class SealWizard(tk.Frame):
         return self._data.get("encryption_done", False)
 
     def _run_encryption(self) -> None:
-        """S1 파일 암호화를 ProgressDialog로 수행."""
+        """S1 파일 암호화를 ProgressDialog로 수행 (1패스: 해시는 암호화 중 인라인 계산)."""
         import os
         from pathlib import Path
         from .progress_dialog import ProgressDialog
@@ -309,45 +431,47 @@ class SealWizard(tk.Frame):
         source = self._data["source_file"]
         output_dir = self._data["output_dir"]
         chunk_gb = self._data["chunk_size_gb"]
-        chunk_bytes = chunk_gb * 1024 ** 3
+        # GCM 안전 마진 때문에 crypto의 MAX_CHUNK_SIZE는 64GiB-16MiB로
+        # UI 최대값(64GB)보다 작다 — seal_process와 동일하게 클램프.
+        from desktop.crypto import MAX_CHUNK_SIZE
+        chunk_bytes = min(chunk_gb * 1024 ** 3, MAX_CHUNK_SIZE)
 
-        # AES 키 생성
-        aes_key = os.urandom(32)
-        self._data["aes_key"] = aes_key
-        self._data["aes_key_hex"] = aes_key.hex()
+        # AES 키: 같은 세션 재시도(취소/오류 후 '다음' 재클릭) 시 반드시
+        # 기존 키를 재사용한다. 새 키를 만들면 .enc.progress 기반 resume이
+        # 이전 키로 암호화된 청크에 새 키 청크를 이어붙여 영구 복호화
+        # 불가가 되기 때문 (crypto 계층의 키 지문 가드와 2중 방어).
+        aes_key = self._data.get("aes_key")
+        if aes_key is None:
+            aes_key = os.urandom(32)
+            self._data["aes_key"] = aes_key
+            self._data["aes_key_hex"] = aes_key.hex()
 
         enc_filename = Path(source).name + ".enc"
         enc_path = str(Path(output_dir) / enc_filename)
-
-        enc_result_holder: list = []
-        enc_error_holder: list = []
+        # 취소/중단 후 위자드가 완료 없이 destroy될 때 부분 산출물을
+        # 정리할 수 있도록 경로를 먼저 기록한다.
+        self._data["enc_path_pending"] = enc_path
 
         def task_fn(progress_cb):
-            try:
-                from desktop.crypto import encrypt_file, collect_metadata
+            from desktop.crypto import encrypt_file
 
-                # 메타데이터 수집
-                meta = collect_metadata(source)
-                self._data["file_metadata"] = meta
-
-                # 암호화 수행
-                result = encrypt_file(
-                    filepath=source,
-                    aes_key=aes_key,
-                    output_path=enc_path,
-                    chunk_size=chunk_bytes,
-                    progress_cb=progress_cb,
-                )
-                enc_result_holder.append(result)
-                return result
-            except Exception as exc:
-                enc_error_holder.append(exc)
-                raise
+            # 메타데이터(MD5/SHA-256)는 encrypt_file 내부에서 암호화
+            # 읽기와 동시에 1패스로 계산된다 (별도 사전 스캔 없음).
+            result = encrypt_file(
+                filepath=source,
+                aes_key=aes_key,
+                output_path=enc_path,
+                chunk_size=chunk_bytes,
+                progress_cb=progress_cb,
+            )
+            return result
 
         def on_complete(result):
             import struct, json
             self._data["enc_path"] = enc_path
             self._data["enc_result"] = result
+            # 1패스 인라인 해시 결과를 S4 미리보기/기록지에 사용
+            self._data["file_metadata"] = result.metadata
 
             # .enc 파일에서 메타데이터 읽기
             try:
@@ -363,6 +487,11 @@ class SealWizard(tk.Frame):
             self._data["encryption_done"] = True
 
         def on_error(exc):
+            # 사용자 취소는 오류가 아니다 — 조용한 상태 메시지만 표시.
+            # (.enc/.enc.progress는 같은 세션 재시도 resume을 위해 유지)
+            if dlg.was_cancelled:
+                self._set_nav_message(t("progress.task_cancelled"), kind="info")
+                return
             messagebox.showerror(
                 t("encrypt.failed_title"),
                 f"{t('encrypt.failed_msg')}:\n{exc}",
@@ -376,7 +505,11 @@ class SealWizard(tk.Frame):
             on_complete=on_complete,
             on_error=on_error,
         )
-        self.winfo_toplevel().wait_window(dlg)
+        self._active_dialog = dlg
+        try:
+            self.winfo_toplevel().wait_window(dlg)
+        finally:
+            self._active_dialog = None
 
         # 시간 정보 저장
         self._data["encrypt_start_time"] = dlg.start_time_iso
@@ -432,24 +565,25 @@ class SealWizard(tk.Frame):
     def _validate_s2(self) -> bool:
         fields = [
             self._case_number,
-            self._investigator_name,
             self._seizure_date,
             self._seizure_location,
+            self._investigator_name,
         ]
-        errors: list[str] = []
+        invalid: list[LabeledEntry] = []
         for f in fields:
             if not f.is_valid():
                 f.highlight_error()
-                errors.append(t("validate.field_required").format(field=f.label.cget("text").strip("* ")))
+                invalid.append(f)
             else:
                 f.clear_error()
-        if errors:
-            messagebox.showwarning(
-                t("common.input_error"),
-                "\n".join(errors),
-                parent=self.winfo_toplevel(),
+        if invalid:
+            self._set_nav_message(
+                t("validate.fix_errors").format(count=len(invalid))
             )
+            invalid[0].focus_field()
             return False
+
+        self._set_nav_message("")
         self._data["case_number"] = self._case_number.get()
         self._data["investigator"] = {
             "name": self._investigator_name.get(),
@@ -471,43 +605,16 @@ class SealWizard(tk.Frame):
     def _build_s3(self, parent: tk.Frame) -> None:
         from tkinter import ttk
 
-        # Scrollable container for S3 (signature pad may not be visible on small screens)
-        canvas = tk.Canvas(parent, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
-        scrollable_frame = tk.Frame(canvas)
-
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda _e: canvas.configure(scrollregion=canvas.bbox("all")),
-        )
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        # Mouse wheel binding for scroll
-        def _on_mousewheel(event: tk.Event) -> None:  # type: ignore[type-arg]
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
-
-        scrollbar.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-
-        # Ensure inner frame stretches to canvas width
-        def _stretch_inner(_e: tk.Event) -> None:  # type: ignore[type-arg]
-            canvas.itemconfig(canvas.find_withtag("all")[0], width=_e.width)
-        canvas.bind("<Configure>", _stretch_inner)
-
-        # Store canvas ref so mousewheel can be unbound when leaving S3
-        self._s3_canvas = canvas
-
+        # NOTE: the wizard-level ScrolledFrame now provides scrolling
+        # for this step, so no dedicated canvas is needed here.
         tk.Label(
-            scrollable_frame,
+            parent,
             text=t("seal.s3_title"),
             font=get_font("header"),
         ).pack(anchor="w", pady=(0, 12))
 
         # --- Personal info group ---
-        person_group = ttk.LabelFrame(scrollable_frame, text=t("seal.subject_info"), padding=(8, 4))
+        person_group = ttk.LabelFrame(parent, text=t("seal.subject_info"), padding=(8, 4))
         person_group.pack(fill="x", pady=(0, 8))
 
         self._subject_name = LabeledEntry(person_group, t("seal.subject_name"), required=True)
@@ -516,14 +623,17 @@ class SealWizard(tk.Frame):
         self._subject_email = LabeledEntry(person_group, t("seal.subject_email"), required=True)
         self._subject_email.pack(fill="x", pady=4)
 
-        self._subject_birth = DateEntry(person_group, t("seal.subject_dob"), required=True)
+        # Birth date: calendar upper bound is the current year (no future DOB)
+        self._subject_birth = DateEntry(
+            person_group, t("seal.subject_dob"), required=True, max_year_offset=0
+        )
         self._subject_birth.pack(fill="x", pady=4)
 
         self._subject_phone = LabeledEntry(person_group, t("seal.subject_phone"), required=True)
         self._subject_phone.pack(fill="x", pady=4)
 
         # --- Security info group ---
-        security_group = ttk.LabelFrame(scrollable_frame, text=t("seal.security_info"), padding=(8, 4))
+        security_group = ttk.LabelFrame(parent, text=t("seal.security_info"), padding=(8, 4))
         security_group.pack(fill="x", pady=(0, 8))
 
         self._subject_password = LabeledEntry(
@@ -552,36 +662,47 @@ class SealWizard(tk.Frame):
             self._subject_password,
             self._subject_password_confirm,
         ]
-        errors: list[str] = []
+        error_count = 0
+        focus_target: Optional[Any] = None
         for f in fields:
             if not f.is_valid():
                 f.highlight_error()
-                errors.append(t("validate.field_required").format(field=f.label.cget("text").strip("* ")))
+                error_count += 1
+                focus_target = focus_target or f
             else:
                 f.clear_error()
 
         pw = self._subject_password.get()
         pw_confirm = self._subject_password_confirm.get()
         if pw and pw_confirm and pw != pw_confirm:
-            errors.append(t("validate.password_mismatch"))
+            self._subject_password_confirm.highlight_error(
+                t("validate.password_mismatch")
+            )
+            error_count += 1
+            focus_target = focus_target or self._subject_password_confirm
 
         if not self._signature_pad.is_valid():
-            errors.append(t("validate.signature_required"))
+            error_count += 1
+            self._signature_pad._status_label.configure(
+                text=t("validate.signature_required"),
+                fg=get_color("danger_text"),
+            )
             logger.warning(
                 "S3 signature validation failed: has_signature=%s, confirmed=%s",
                 self._signature_pad._has_signature,
                 self._signature_pad._confirmed,
             )
 
-        if errors:
-            logger.info("S3 validation errors: %s", errors)
-            messagebox.showwarning(
-                t("common.input_error"),
-                "\n".join(errors),
-                parent=self.winfo_toplevel(),
+        if error_count:
+            logger.info("S3 validation failed with %d error(s)", error_count)
+            self._set_nav_message(
+                t("validate.fix_errors").format(count=error_count)
             )
+            if focus_target is not None:
+                focus_target.focus_field()
             return False
 
+        self._set_nav_message("")
         self._data["subject"] = {
             "name": self._subject_name.get(),
             "email": self._subject_email.get(),
@@ -606,20 +727,13 @@ class SealWizard(tk.Frame):
         tk.Label(
             parent,
             text=t("seal.s4_title"),
-            font=("맑은 고딕", 12, "bold"),
+            font=get_font("subheader"),
+            bg=get_color("bg"),
+            fg=get_color("heading"),
         ).pack(anchor="w", pady=(0, 12))
 
-        self._preview_text = tk.Text(
-            parent,
-            wrap="word",
-            state="disabled",
-            font=("맑은 고딕", 9),
-            height=22,
-        )
-        scrollbar = tk.Scrollbar(parent, command=self._preview_text.yview)
-        self._preview_text.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side="right", fill="y")
-        self._preview_text.pack(fill="both", expand=True)
+        self._s4_summary = SummaryView(parent)
+        self._s4_summary.pack(fill="both", expand=True)
 
         self._validators.append(self._validate_s4)
 
@@ -755,45 +869,77 @@ class SealWizard(tk.Frame):
             "derived_files": [],
         }
 
-    def _refresh_s4_preview(self) -> None:
-        """Populate the preview text with collected data."""
-        self._preview_text.configure(state="normal")
-        self._preview_text.delete("1.0", "end")
+    @staticmethod
+    def _section_title(key: str) -> str:
+        """Strip bracket decoration from legacy i18n section keys."""
+        return t(key).strip("[] ")
 
-        lines = [
-            "=" * 50,
-            t("preview.seal_title"),
-            "=" * 50,
-            "",
-            t("preview.case_info"),
-            t("preview.case_number").format(v=self._data.get('case_number', '')),
-            t("preview.investigator_name").format(v=self._data.get('investigator', {}).get('name', '')),
-            t("preview.investigator_rank").format(v=self._data.get('investigator', {}).get('rank', '')),
-            "",
-            t("preview.seizure_info"),
-            t("preview.seizure_datetime").format(v=self._data.get('seizure', {}).get('datetime', '')),
-            t("preview.seizure_location").format(v=self._data.get('seizure', {}).get('location', '')),
-            "",
-            t("preview.media_info"),
-            t("preview.media_manufacturer").format(v=self._data.get('media', {}).get('manufacturer', '')),
-            t("preview.media_model").format(v=self._data.get('media', {}).get('model', '')),
-            f"  S/N: {self._data.get('media', {}).get('serial', '')}",
-            "",
-            t("preview.subject_info"),
-            t("preview.subject_name").format(v=self._data.get('subject', {}).get('name', '')),
-            t("preview.subject_email").format(v=self._data.get('subject', {}).get('email', '')),
-            t("preview.subject_dob").format(v=self._data.get('subject', {}).get('birth', '')),
-            t("preview.subject_phone").format(v=self._data.get('subject', {}).get('phone', '')),
-            "",
-            t("preview.target_file_section"),
-            t("preview.file_path").format(v=self._data.get('source_file', '')),
-            t("preview.chunk_size").format(v=self._data.get('chunk_size_gb', '')),
-            "",
-            "=" * 50,
-            t("preview.confirm_next"),
+    def _refresh_s4_preview(self) -> None:
+        """Populate the S4 preview cards with collected data."""
+        investigator = self._data.get("investigator", {})
+        seizure = self._data.get("seizure", {})
+        media = self._data.get("media", {})
+        subject = self._data.get("subject", {})
+        meta = self._data.get("file_metadata")
+
+        file_rows: list[tuple] = [
+            (t("summary.source_file"), self._data.get("source_file", "")),
+            (t("summary.chunk_size"), f"{self._data.get('chunk_size_gb', '')} GB"),
         ]
-        self._preview_text.insert("1.0", "\n".join(lines))
-        self._preview_text.configure(state="disabled")
+        if meta:
+            gb = meta.size / (1024 ** 3)
+            file_rows.extend([
+                (t("summary.file_size"), f"{meta.size:,} bytes ({gb:.3f} GB)"),
+                (t("summary.sha256"), meta.sha256),
+                (t("summary.md5"), meta.md5),
+            ])
+        enc_path = self._data.get("enc_path")
+        if enc_path:
+            file_rows.append((t("summary.enc_file"), enc_path))
+
+        sections = [
+            {
+                "title": self._section_title("preview.case_info"),
+                "rows": [
+                    (t("summary.case_number"), self._data.get("case_number", "")),
+                    (t("summary.investigator"), investigator.get("name", "")),
+                    (t("summary.rank"), investigator.get("rank", "")),
+                ],
+            },
+            {
+                "title": self._section_title("preview.seizure_info"),
+                "rows": [
+                    (t("summary.seizure_datetime"), seizure.get("datetime", "")),
+                    (t("summary.seizure_location"), seizure.get("location", "")),
+                ],
+            },
+            {
+                "title": self._section_title("preview.media_info"),
+                "rows": [
+                    (t("summary.manufacturer"), media.get("manufacturer", "")),
+                    (t("summary.model"), media.get("model", "")),
+                    (t("summary.serial"), media.get("serial", "")),
+                ],
+            },
+            {
+                "title": self._section_title("preview.subject_info"),
+                "rows": [
+                    (t("summary.subject"), subject.get("name", "")),
+                    (t("summary.email"), subject.get("email", "")),
+                    (t("summary.dob"), subject.get("birth", "")),
+                    (t("summary.phone"), subject.get("phone", "")),
+                ],
+            },
+            {
+                "title": self._section_title("preview.target_file_section"),
+                "rows": file_rows,
+            },
+            {
+                "title": "",
+                "rows": [("", t("preview.confirm_next"))],
+            },
+        ]
+        self._s4_summary.render(sections)
 
     # --- S5: Digital signature progress -----------------------------------
 
@@ -801,20 +947,29 @@ class SealWizard(tk.Frame):
         tk.Label(
             parent,
             text=t("seal.s5_title"),
-            font=("맑은 고딕", 12, "bold"),
+            font=get_font("subheader"),
+            bg=get_color("bg"),
+            fg=get_color("heading"),
         ).pack(anchor="w", pady=(0, 12))
 
         self._s5_status = tk.Text(
             parent,
             wrap="word",
             state="disabled",
-            font=("맑은 고딕", 9),
+            font=get_font("caption"),
+            bg=get_color("card_bg"),
+            fg=get_color("text"),
+            relief="solid",
+            bd=1,
+            highlightthickness=0,
             height=18,
         )
         self._s5_status.pack(fill="both", expand=True, pady=4)
 
         self._s5_progress_label = tk.Label(
-            parent, text=t("seal.s5_waiting"), anchor="w"
+            parent, text=t("seal.s5_waiting"), anchor="w",
+            bg=get_color("bg"), fg=get_color("text_secondary"),
+            font=get_font("small"),
         )
         self._s5_progress_label.pack(fill="x", pady=4)
 
@@ -939,7 +1094,9 @@ class SealWizard(tk.Frame):
     def _mark_s5_done(self) -> None:
         """S5 완료 마킹 — 다음 버튼 활성화."""
         self._data["signature_done"] = True
-        self._s5_progress_label.configure(text=t("seal.s5_complete"))
+        self._s5_progress_label.configure(
+            text=t("seal.s5_complete"), fg=get_color("success_text")
+        )
 
     # --- S6: Key split results + unlock_time ------------------------------
 
@@ -947,14 +1104,19 @@ class SealWizard(tk.Frame):
         tk.Label(
             parent,
             text=t("seal.s6_title"),
-            font=("맑은 고딕", 12, "bold"),
+            font=get_font("subheader"),
         ).pack(anchor="w", pady=(0, 12))
 
         self._s6_result = tk.Text(
             parent,
             wrap="word",
             state="disabled",
-            font=("맑은 고딕", 9),
+            font=get_font("caption"),
+            bg=get_color("card_bg"),
+            fg=get_color("text"),
+            relief="solid",
+            bd=1,
+            highlightthickness=0,
             height=12,
         )
         self._s6_result.pack(fill="both", expand=True, pady=4)
@@ -988,13 +1150,15 @@ class SealWizard(tk.Frame):
             if not (MIN_UNLOCK_DAYS <= days <= MAX_UNLOCK_DAYS):
                 raise ValueError
         except (tk.TclError, ValueError):
-            messagebox.showwarning(
-                t("common.input_error"),
-                t("validate.unlock_range").format(min=MIN_UNLOCK_DAYS, max=MAX_UNLOCK_DAYS),
-                parent=self.winfo_toplevel(),
+            self._set_nav_message(
+                t("validate.unlock_range").format(
+                    min=MIN_UNLOCK_DAYS, max=MAX_UNLOCK_DAYS
+                )
             )
+            self._unlock_spin.focus_set()
             return False
 
+        self._set_nav_message("")
         now = datetime.now(tz=timezone.utc)
         unlock_time = now + timedelta(days=days)
         self._data["unlock_days"] = days
@@ -1057,16 +1221,12 @@ class SealWizard(tk.Frame):
         tk.Label(
             parent,
             text=t("seal.s7_title"),
-            font=("맑은 고딕", 12, "bold"),
+            font=get_font("subheader"),
+            bg=get_color("bg"),
+            fg=get_color("heading"),
         ).pack(anchor="w", pady=(0, 12))
 
-        self._s7_summary = tk.Text(
-            parent,
-            wrap="word",
-            state="disabled",
-            font=("맑은 고딕", 9),
-            height=20,
-        )
+        self._s7_summary = SummaryView(parent)
         self._s7_summary.pack(fill="both", expand=True, pady=4)
 
         self._validators.append(self._validate_s7)
@@ -1076,16 +1236,13 @@ class SealWizard(tk.Frame):
         return True
 
     def _refresh_s7_summary(self) -> None:
-        """Populate the final summary with time information."""
-        self._s7_summary.configure(state="normal")
-        self._s7_summary.delete("1.0", "end")
+        """Populate the final summary cards with time information."""
+        from .progress_dialog import _fmt_time
 
         seal_id = self._data.get("seal_id", "N/A")
         enc_start = self._data.get("encrypt_start_time", "N/A")
         enc_end = self._data.get("encrypt_end_time", "N/A")
         enc_elapsed = self._data.get("encrypt_elapsed", 0)
-
-        from .progress_dialog import _fmt_time
 
         meta = self._data.get("file_metadata")
         file_size_str = ""
@@ -1093,39 +1250,49 @@ class SealWizard(tk.Frame):
             gb = meta.size / (1024 ** 3)
             file_size_str = f"{meta.size:,} bytes ({gb:.3f} GB)"
 
-        lines = [
-            "=" * 50,
-            t("complete.seal_title"),
-            "=" * 50,
-            "",
-            t("complete.seal_info_section"),
-            f"  Seal ID       : {seal_id}",
-            t("complete.case_number").format(v=self._data.get('case_number', '')),
-            t("complete.subject").format(v=self._data.get('subject', {}).get('name', '')),
-            t("complete.investigator").format(v=self._data.get('investigator', {}).get('name', '')),
-            "",
-            t("complete.file_section"),
-            t("complete.filename").format(v=self._data.get('source_file', '')),
-            t("complete.filesize").format(v=file_size_str),
-            t("complete.enc_file").format(v=self._data.get('enc_path', 'N/A')),
-            "",
-            t("complete.time_section"),
-            t("complete.enc_start").format(v=enc_start),
-            t("complete.enc_end").format(v=enc_end),
-            t("complete.enc_elapsed").format(v=_fmt_time(enc_elapsed)),
-            "",
-            t("complete.key_section"),
-            f"  unlock_time   : {self._data.get('unlock_time_iso', 'N/A')}",
-            t("complete.key_shares"),
-            "",
-            t("complete.notice_section"),
-            t("complete.seal_saved"),
-            t("complete.key_instruction"),
-            "",
-            "=" * 50,
+        sections = [
+            {
+                "title": t("complete.seal_title").strip(),
+                "badge": (t("common.complete"), "success"),
+                "rows": [
+                    (t("summary.seal_id"), seal_id),
+                    (t("summary.case_number"), self._data.get("case_number", "")),
+                    (t("summary.subject"), self._data.get("subject", {}).get("name", "")),
+                    (t("summary.investigator"), self._data.get("investigator", {}).get("name", "")),
+                ],
+            },
+            {
+                "title": self._section_title("complete.file_section"),
+                "rows": [
+                    (t("summary.source_file"), self._data.get("source_file", "")),
+                    (t("summary.file_size"), file_size_str),
+                    (t("summary.enc_file"), self._data.get("enc_path", "N/A")),
+                ],
+            },
+            {
+                "title": self._section_title("complete.time_section"),
+                "rows": [
+                    (t("summary.enc_start"), enc_start),
+                    (t("summary.enc_end"), enc_end),
+                    (t("summary.elapsed"), _fmt_time(enc_elapsed)),
+                ],
+            },
+            {
+                "title": self._section_title("complete.key_section"),
+                "rows": [
+                    (t("summary.unlock_time"), self._data.get("unlock_time_iso", "N/A")),
+                    (t("summary.key_shares"), "4 (SSS 2-of-4)"),
+                ],
+            },
+            {
+                "title": t("summary.notice"),
+                "rows": [
+                    ("", _clean_multiline(t("complete.seal_saved"))),
+                    ("", _clean_multiline(t("complete.key_instruction"))),
+                ],
+            },
         ]
-        self._s7_summary.insert("1.0", "\n".join(lines))
-        self._s7_summary.configure(state="disabled")
+        self._s7_summary.render(sections)
 
     # ------------------------------------------------------------------
     # Navigation
@@ -1133,23 +1300,14 @@ class SealWizard(tk.Frame):
 
     def _show_step(self, index: int) -> None:
         """Display the given step frame and hide others."""
-        # Unbind S3 mousewheel when leaving S3
-        if hasattr(self, "_s3_canvas") and self._current_step == 2 and index != 2:
-            try:
-                self._s3_canvas.unbind_all("<MouseWheel>")
-            except Exception:
-                pass
-
         for frame in self._steps:
             frame.pack_forget()
-        self._steps[index].pack(fill="both", expand=True)
+        holder = self._steps[index]
+        holder.pack(fill="both", expand=True)
+        if isinstance(holder, ScrolledFrame):
+            holder.scroll_to_top()
         self._current_step = index
-
-        # Re-bind S3 mousewheel when entering S3
-        if hasattr(self, "_s3_canvas") and index == 2:
-            def _on_mousewheel(event: tk.Event) -> None:  # type: ignore[type-arg]
-                self._s3_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-            self._s3_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        self._set_nav_message("")
 
         step_num = index + 1
         self._step_label.configure(
@@ -1183,6 +1341,8 @@ class SealWizard(tk.Frame):
 
     def _on_step_click(self, step_index: int) -> None:
         """Handle step indicator click to navigate or view past steps."""
+        if self._busy:
+            return
         current = self._current_step
 
         # Cannot navigate to future steps
@@ -1220,25 +1380,28 @@ class SealWizard(tk.Frame):
         )
         self._show_step(actual_step)
 
-    def _on_return_key(self, event: tk.Event) -> None:  # type: ignore[type-arg]
-        """Handle Return key — skip if focus is inside an Entry widget."""
-        focused = self.winfo_toplevel().focus_get()
-        if isinstance(focused, tk.Entry):
+    def _on_return_key(self, _event: tk.Event) -> None:  # type: ignore[type-arg]
+        """Handle Return key — skip while focus is in an input widget."""
+        if self._busy:
+            return
+        try:
+            focused = self.winfo_toplevel().focus_get()
+        except (KeyError, tk.TclError):
+            return
+        if not is_return_navigation_safe(focused):
             return
         self._go_next()
+
+    def _on_escape_key(self, _event: tk.Event) -> None:  # type: ignore[type-arg]
+        if self._busy:
+            return
+        self._handle_cancel()
 
     def _go_next(self) -> None:
         """Advance to the next step after validation."""
         idx = self._current_step
-        print(f"[DEBUG] _go_next called at step {idx} (S{idx+1})")
         validator = self._validators[idx]
-        valid = validator()
-        print(f"[DEBUG] validator returned: {valid}")
-        if not valid:
-            if idx == 2:  # S3
-                print(f"[DEBUG] S3 sig: has={self._signature_pad._has_signature}, confirmed={self._signature_pad._confirmed}, is_valid={self._signature_pad.is_valid()}")
-                for f in [self._subject_name, self._subject_email, self._subject_birth, self._subject_phone, self._subject_password, self._subject_password_confirm]:
-                    print(f"[DEBUG]   {f.label.cget('text')}: val='{f.get()}', valid={f.is_valid()}")
+        if not validator():
             return
 
         if idx == self.TOTAL_STEPS - 1:
@@ -1289,4 +1452,6 @@ class SealWizard(tk.Frame):
     def set_s5_complete(self) -> None:
         """Mark S5 as done so the user can proceed."""
         self._data["signature_done"] = True
-        self._s5_progress_label.configure(text=t("seal.s5_complete"))
+        self._s5_progress_label.configure(
+            text=t("seal.s5_complete"), fg=get_color("success_text")
+        )
