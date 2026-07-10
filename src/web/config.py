@@ -6,12 +6,21 @@ import os
 import secrets
 
 
+# Default request body size limit: 50 MB (seal record PDFs included)
+DEFAULT_MAX_CONTENT_LENGTH: int = 50 * 1024 * 1024
+
+
 class BaseConfig:
     """Base configuration with defaults."""
 
     SECRET_KEY: str = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(32))
     SESSION_COOKIE_HTTPONLY: bool = True
     SESSION_COOKIE_SAMESITE: str = "Lax"
+
+    # --- Request limits ---
+    MAX_CONTENT_LENGTH: int = int(
+        os.environ.get("MAX_CONTENT_LENGTH", str(DEFAULT_MAX_CONTENT_LENGTH))
+    )
 
     # --- Database ---
     # MariaDB (primary)
@@ -44,6 +53,7 @@ class BaseConfig:
     SMTP_FROM: str = os.environ.get("SMTP_FROM", "seal-system@example.com")
     SMTP_USE_TLS: bool = os.environ.get("SMTP_USE_TLS", "true").lower() == "true"
     SMTP_MOCK: bool = os.environ.get("SMTP_MOCK", "true").lower() == "true"
+    SMTP_TIMEOUT_SECONDS: int = int(os.environ.get("SMTP_TIMEOUT_SECONDS", "10"))
 
     # --- Auth ---
     AUTH_MAX_FAILURES: int = 5

@@ -11,6 +11,7 @@ POST /sync/upload-record  -- SQLite -> MariaDB record sync
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 from typing import Any
@@ -22,6 +23,9 @@ from ..models.db_models import insert_seal_record
 logger = logging.getLogger(__name__)
 
 bp = Blueprint("sync", __name__, url_prefix="/sync")
+
+# Maximum accepted base64-encoded PDF length (~30 MB decoded)
+MAX_PDF_B64_LENGTH = 40 * 1024 * 1024
 
 
 @bp.route("/upload-record", methods=["POST"])
@@ -74,13 +78,15 @@ def upload_record() -> tuple[Any, int]:
     except (json.JSONDecodeError, TypeError):
         return jsonify({"status": "error", "message": "record_json이 올바른 JSON이 아닙니다."}), 400
 
-    # Decode optional PDF
+    # Decode optional PDF (validate type/length before decoding)
     record_pdf: bytes | None = None
     if record_pdf_b64:
-        import base64
-
+        if not isinstance(record_pdf_b64, str):
+            return jsonify({"status": "error", "message": "record_pdf는 base64 문자열이어야 합니다."}), 400
+        if len(record_pdf_b64) > MAX_PDF_B64_LENGTH:
+            return jsonify({"status": "error", "message": "record_pdf가 허용 크기를 초과했습니다."}), 413
         try:
-            record_pdf = base64.b64decode(record_pdf_b64)
+            record_pdf = base64.b64decode(record_pdf_b64, validate=True)
         except Exception:
             return jsonify({"status": "error", "message": "record_pdf의 base64 디코딩에 실패했습니다."}), 400
 

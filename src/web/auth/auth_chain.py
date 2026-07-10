@@ -19,6 +19,22 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def normalize_birth_date(value: str) -> str:
+    """Normalize a birth date string to canonical ``YYYYMMDD`` form.
+
+    Accepts both legacy (``19900101``) and HTML ``<input type="date">``
+    (``1990-01-01``) representations by extracting digits only, so that
+    stored and submitted values compare equal regardless of formatting.
+
+    Args:
+        value: Raw birth date string (may contain separators).
+
+    Returns:
+        Digits-only canonical string (empty string if no digits).
+    """
+    return "".join(ch for ch in (value or "") if ch.isdigit())
+
+
 @dataclass(frozen=True)
 class AuthResult:
     """Immutable result of an authentication attempt."""
@@ -84,7 +100,7 @@ class BasicAuthenticator(BaseAuthenticator):
 
         if (
             input_name == stored_name
-            and input_birth == stored_birth
+            and normalize_birth_date(input_birth) == normalize_birth_date(stored_birth)
             and input_phone == stored_phone
         ):
             return AuthResult(success=True, step=self.name, message="기본 인증 성공")

@@ -29,6 +29,7 @@ from flask import (
     url_for,
 )
 
+from ..auth.auth_chain import normalize_birth_date
 from ..models.db_models import (
     find_case_by_seal_id,
     find_key_shares_by_seal_id,
@@ -60,7 +61,10 @@ def register_case() -> Any:
     investigator_name = (request.form.get("investigator") or "").strip()
     suspect_name = (request.form.get("suspect_name") or "").strip()
     suspect_email = (request.form.get("suspect_email") or "").strip()
-    suspect_birth = (request.form.get("suspect_birth") or "").strip()
+    # Canonicalize birth date (accepts '1990-01-01' and '19900101' forms)
+    suspect_birth = normalize_birth_date(
+        (request.form.get("suspect_birth") or "").strip()
+    )
     suspect_phone = (request.form.get("suspect_phone") or "").strip()
     auth_level = (request.form.get("auth_level") or "basic").strip()
     password_raw = request.form.get("password") or ""

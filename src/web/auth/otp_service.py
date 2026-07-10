@@ -47,6 +47,7 @@ class OTPService:
     _smtp_from: ClassVar[str] = "seal-system@example.com"
     _smtp_use_tls: ClassVar[bool] = True
     _smtp_mock: ClassVar[bool] = True
+    _smtp_timeout: ClassVar[int] = 10
 
     # ------------------------------------------------------------------
     @classmethod
@@ -62,6 +63,7 @@ class OTPService:
         smtp_from: str = "seal-system@example.com",
         smtp_use_tls: bool = True,
         smtp_mock: bool = True,
+        smtp_timeout: int = 10,
     ) -> None:
         """Set OTP/SMTP parameters (typically called once at app startup)."""
         cls._otp_length = otp_length
@@ -73,6 +75,7 @@ class OTPService:
         cls._smtp_from = smtp_from
         cls._smtp_use_tls = smtp_use_tls
         cls._smtp_mock = smtp_mock
+        cls._smtp_timeout = smtp_timeout
 
     # ------------------------------------------------------------------
     # Generation
@@ -127,12 +130,12 @@ class OTPService:
             msg["From"] = self._smtp_from
             msg["To"] = email
 
+            server = smtplib.SMTP(
+                self._smtp_host, self._smtp_port, timeout=self._smtp_timeout
+            )
             if self._smtp_use_tls:
-                server = smtplib.SMTP(self._smtp_host, self._smtp_port)
                 server.ehlo()
                 server.starttls()
-            else:
-                server = smtplib.SMTP(self._smtp_host, self._smtp_port)
 
             if self._smtp_user:
                 server.login(self._smtp_user, self._smtp_password)

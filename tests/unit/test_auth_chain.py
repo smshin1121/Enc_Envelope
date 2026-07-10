@@ -22,6 +22,7 @@ from web.auth.auth_chain import (
     BasicAuthenticator,
     OTPAuthenticator,
     PasswordAuthenticator,
+    normalize_birth_date,
 )
 from web.auth.otp_service import OTPService
 
@@ -116,6 +117,57 @@ class TestBasicAuthenticator:
         }
         result = self.auth.authenticate(self.case, creds)
         assert result.success is True
+
+    # --- Regression: legacy vs HTML date-input birth formats ---
+
+    def test_legacy_stored_birth_with_date_input(self) -> None:
+        """DB has legacy '19900101', <input type=date> submits '1990-01-01'."""
+        case = _make_case(suspect_birth="19900101")
+        creds = {
+            "name": "홍길동",
+            "birth_date": "1990-01-01",
+            "phone": "010-1234-5678",
+        }
+        result = self.auth.authenticate(case, creds)
+        assert result.success is True
+
+    def test_dashed_stored_birth_with_legacy_input(self) -> None:
+        """DB has '1990-01-01', user submits legacy '19900101'."""
+        case = _make_case(suspect_birth="1990-01-01")
+        creds = {
+            "name": "홍길동",
+            "birth_date": "19900101",
+            "phone": "010-1234-5678",
+        }
+        result = self.auth.authenticate(case, creds)
+        assert result.success is True
+
+    def test_birth_mismatch_across_formats(self) -> None:
+        """Normalization must not turn genuinely different dates into a match."""
+        case = _make_case(suspect_birth="19900101")
+        creds = {
+            "name": "홍길동",
+            "birth_date": "2000-01-01",
+            "phone": "010-1234-5678",
+        }
+        result = self.auth.authenticate(case, creds)
+        assert result.success is False
+
+
+class TestNormalizeBirthDate:
+    """normalize_birth_date: canonical YYYYMMDD extraction."""
+
+    def test_dashed_form(self) -> None:
+        assert normalize_birth_date("1990-01-01") == "19900101"
+
+    def test_legacy_form(self) -> None:
+        assert normalize_birth_date("19900101") == "19900101"
+
+    def test_dotted_form(self) -> None:
+        assert normalize_birth_date("1990.01.01") == "19900101"
+
+    def test_empty(self) -> None:
+        assert normalize_birth_date("") == ""
 
 
 # ===================================================================

@@ -14,7 +14,7 @@ import os
 import secrets
 from typing import Any
 
-from flask import Flask, render_template, request
+from flask import Flask, jsonify, render_template, request
 
 from .config import get_config
 from .models.db_models import close_db, init_db
@@ -64,6 +64,7 @@ def create_app(config_env: str | None = None) -> Flask:
         smtp_from=app.config.get("SMTP_FROM", "seal-system@example.com"),
         smtp_use_tls=app.config.get("SMTP_USE_TLS", True),
         smtp_mock=app.config.get("SMTP_MOCK", True),
+        smtp_timeout=app.config.get("SMTP_TIMEOUT_SECONDS", 10),
     )
 
     # ------------------------------------------------------------------
@@ -153,6 +154,15 @@ def _setup_csrf(app: Flask) -> None:
 # Error handlers (no internal information leakage)
 # ======================================================================
 
+def _wants_json_error() -> bool:
+    """Return True when the current request should get a JSON error body."""
+    if request.path.startswith("/sync/"):
+        return True
+    if request.is_json:
+        return True
+    return "application/json" in (request.headers.get("Accept") or "")
+
+
 def _register_error_handlers(app: Flask) -> None:
     """Register custom error pages."""
 
@@ -167,6 +177,22 @@ def _register_error_handlers(app: Flask) -> None:
     @app.errorhandler(404)
     def not_found(e: Exception) -> tuple[str, int]:
         return render_template("errors/404.html"), 404
+
+    @app.errorhandler(413)
+    def payload_too_large(e: Exception) -> Any:
+        # Sync endpoints and JSON clients must receive a JSON error body
+        # (Werkzeug's default HTML 413 breaks the sync client's JSON contract).
+        if _wants_json_error():
+            return (
+                jsonify(
+                    {
+                        "status": "error",
+                        "message": "요청 본문이 허용 크기를 초과했습니다.",
+                    }
+                ),
+                413,
+            )
+        return e  # keep default Werkzeug behavior for browser clients
 
     @app.errorhandler(429)
     def too_many_requests(e: Exception) -> tuple[str, int]:

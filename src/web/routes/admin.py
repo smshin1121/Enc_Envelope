@@ -23,8 +23,8 @@ from flask import (
 )
 
 from ..models.db_models import (
+    find_admin_share_summaries,
     find_key_shares_by_seal_id,
-    execute_query,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,10 +56,7 @@ def shares() -> Any:
         flash("관리자 인증이 필요합니다.", "danger")
         return redirect(url_for("admin.login"))
 
-    rows = execute_query(
-        "SELECT * FROM key_shares WHERE share_index = 4 ORDER BY uploaded_at DESC",
-        fetch_all=True,
-    ) or []
+    rows = find_admin_share_summaries()
 
     shares_list: list[dict[str, Any]] = []
     for row in rows:
@@ -72,9 +69,8 @@ def shares() -> Any:
                 "id": row[0],
                 "seal_id": row[1],
                 "share_index": row[2],
-                "share_data": row[3],
-                "uploaded_by": row[4],
-                "uploaded_at": row[5],
+                "uploaded_by": row[3],
+                "uploaded_at": row[4],
             })
 
     return render_template("shares.html", shares=shares_list)

@@ -85,6 +85,12 @@ CREATE TABLE IF NOT EXISTS auth_failures (
     ip_address  TEXT    NOT NULL DEFAULT '',
     failed_at   TEXT    NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE INDEX IF NOT EXISTS idx_auth_failures_lookup
+    ON auth_failures (seal_id, ip_address, failed_at);
+
+CREATE INDEX IF NOT EXISTS idx_key_shares_index_uploaded
+    ON key_shares (share_index, uploaded_at);
 """
 
 _MARIADB_SCHEMA = """
@@ -144,6 +150,12 @@ CREATE TABLE IF NOT EXISTS auth_failures (
     ip_address VARCHAR(45) NOT NULL DEFAULT '',
     failed_at  DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE INDEX IF NOT EXISTS idx_auth_failures_lookup
+    ON auth_failures (seal_id, ip_address, failed_at);
+
+CREATE INDEX IF NOT EXISTS idx_key_shares_index_uploaded
+    ON key_shares (share_index, uploaded_at);
 """
 
 
@@ -420,6 +432,60 @@ def find_seal_records_by_seal_id(seal_id: str) -> list[Any]:
     return execute_query(
         "SELECT * FROM seal_records WHERE seal_id = ? ORDER BY event_id",
         (seal_id,),
+        fetch_all=True,
+    ) or []
+
+
+def find_seal_record_summaries_by_seal_id(seal_id: str) -> list[Any]:
+    """Find seal record summaries (list view) for a given seal_id.
+
+    Excludes the heavy ``record_json`` / ``record_pdf`` columns so that
+    listing pages do not load large payloads. Use
+    :func:`find_seal_record_json` for the detail view.
+
+    Returns:
+        List of row dicts/tuples with
+        (id, seal_id, event_id, event_type, synced_at).
+    """
+    return execute_query(
+        """SELECT id, seal_id, event_id, event_type, synced_at
+           FROM seal_records WHERE seal_id = ? ORDER BY event_id""",
+        (seal_id,),
+        fetch_all=True,
+    ) or []
+
+
+def find_seal_record_json(seal_id: str, event_id: int) -> str | None:
+    """Fetch the record_json payload of a single seal record.
+
+    Returns:
+        The record JSON string, or None if not found.
+    """
+    row = execute_query(
+        "SELECT record_json FROM seal_records WHERE seal_id = ? AND event_id = ?",
+        (seal_id, event_id),
+        fetch_one=True,
+    )
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return row.get("record_json")
+    if hasattr(row, "keys"):
+        return row["record_json"]
+    return row[0]
+
+
+def find_admin_share_summaries() -> list[Any]:
+    """List admin key shares (share_index = 4) without share_data payload.
+
+    Returns:
+        List of row dicts/tuples with
+        (id, seal_id, share_index, uploaded_by, uploaded_at).
+    """
+    return execute_query(
+        """SELECT id, seal_id, share_index, uploaded_by, uploaded_at
+           FROM key_shares WHERE share_index = 4
+           ORDER BY uploaded_at DESC""",
         fetch_all=True,
     ) or []
 

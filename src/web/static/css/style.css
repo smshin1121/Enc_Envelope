@@ -1,5 +1,53 @@
 /* 전자봉인시스템 기본 스타일 */
 
+/* --- 브랜드 팔레트 (데스크톱 Stripe 팔레트와 통일) --- */
+:root {
+    --brand-primary: #533afd;
+    --brand-primary-hover: #4530d9;
+    --brand-primary-active: #3b28bd;
+    --brand-navy: #061b31;
+    --bs-primary: #533afd;
+    --bs-primary-rgb: 83, 58, 253;
+    --bs-link-color: #533afd;
+    --bs-link-color-rgb: 83, 58, 253;
+    --bs-link-hover-color: #4530d9;
+    --bs-link-hover-color-rgb: 69, 48, 217;
+}
+
+.btn-primary {
+    --bs-btn-bg: var(--brand-primary);
+    --bs-btn-border-color: var(--brand-primary);
+    --bs-btn-hover-bg: var(--brand-primary-hover);
+    --bs-btn-hover-border-color: var(--brand-primary-hover);
+    --bs-btn-active-bg: var(--brand-primary-active);
+    --bs-btn-active-border-color: var(--brand-primary-active);
+    --bs-btn-disabled-bg: var(--brand-primary);
+    --bs-btn-disabled-border-color: var(--brand-primary);
+    --bs-btn-focus-shadow-rgb: 83, 58, 253;
+}
+
+.btn-outline-primary {
+    --bs-btn-color: var(--brand-primary);
+    --bs-btn-border-color: var(--brand-primary);
+    --bs-btn-hover-bg: var(--brand-primary);
+    --bs-btn-hover-border-color: var(--brand-primary);
+    --bs-btn-active-bg: var(--brand-primary-active);
+    --bs-btn-active-border-color: var(--brand-primary-active);
+    --bs-btn-focus-shadow-rgb: 83, 58, 253;
+}
+
+/* Navbar: deep navy 브랜드 컬러 */
+.navbar.bg-dark {
+    background-color: var(--brand-navy) !important;
+}
+
+/* Form focus ring: 브랜드 컬러 일관 적용 */
+.form-control:focus,
+.form-select:focus {
+    border-color: #a99cfe;
+    box-shadow: 0 0 0 0.25rem rgba(83, 58, 253, 0.25);
+}
+
 body {
     font-family: 'Segoe UI', 'Malgun Gothic', '맑은 고딕', sans-serif;
     background-color: #f8f9fa;

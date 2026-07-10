@@ -18,6 +18,7 @@ from flask import (
     Blueprint,
     current_app,
     flash,
+    jsonify,
     redirect,
     render_template,
     request,
@@ -30,7 +31,8 @@ from ..auth.otp_service import OTPService
 from ..models.db_models import (
     count_recent_auth_failures,
     find_case_by_seal_id,
-    find_seal_records_by_seal_id,
+    find_seal_record_json,
+    find_seal_record_summaries_by_seal_id,
     insert_key_share,
     record_auth_failure,
 )
@@ -63,9 +65,20 @@ def _case_to_dict(row: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # GET/POST /suspect/auth/<seal_id>
 # ---------------------------------------------------------------------------
+@bp.route("/auth/", defaults={"seal_id": ""}, methods=["GET"])
 @bp.route("/auth/<seal_id>", methods=["GET", "POST"])
 def auth(seal_id: str) -> Any:
     """Suspect identity verification page."""
+    if not seal_id:
+        return render_template(
+            "auth.html",
+            seal_id="",
+            case=None,
+            auth_level="basic",
+            otp_session_id="",
+            locked=False,
+        )
+
     case_row = find_case_by_seal_id(seal_id)
     if not case_row:
         flash("해당 봉인 ID의 사건이 존재하지 않습니다.", "danger")
@@ -136,19 +149,37 @@ def auth(seal_id: str) -> Any:
 # ---------------------------------------------------------------------------
 # POST /suspect/send-otp/<seal_id>
 # ---------------------------------------------------------------------------
+def _wants_json_response() -> bool:
+    """Check whether the client expects a JSON response (fetch/AJAX)."""
+    if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        return True
+    return "application/json" in (request.headers.get("Accept") or "")
+
+
 @bp.route("/send-otp/<seal_id>", methods=["POST"])
 def send_otp(seal_id: str) -> Any:
-    """Send OTP email to the suspect's registered address."""
+    """Send OTP email to the suspect's registered address.
+
+    Supports both classic form POST (redirect + flash) and
+    fetch()-based async requests (JSON response).
+    """
+    wants_json = _wants_json_response()
+
+    def _respond(success: bool, message: str, category: str) -> Any:
+        if wants_json:
+            status = 200 if success else 400
+            return jsonify({"success": success, "message": message}), status
+        flash(message, category)
+        return redirect(url_for("suspect.auth", seal_id=seal_id))
+
     case_row = find_case_by_seal_id(seal_id)
     if not case_row:
-        flash("사건을 찾을 수 없습니다.", "danger")
-        return redirect(url_for("suspect.auth", seal_id=seal_id))
+        return _respond(False, "사건을 찾을 수 없습니다.", "danger")
 
     case = _case_to_dict(case_row)
     email = case.get("suspect_email", "")
     if not email:
-        flash("등록된 이메일이 없습니다.", "danger")
-        return redirect(url_for("suspect.auth", seal_id=seal_id))
+        return _respond(False, "등록된 이메일이 없습니다.", "danger")
 
     otp_session_id = str(uuid.uuid4())
     session[f"otp_session_{seal_id}"] = otp_session_id
@@ -159,11 +190,8 @@ def send_otp(seal_id: str) -> Any:
     sent = svc.send_otp(email, code)
 
     if sent:
-        flash("인증번호가 이메일로 발송되었습니다.", "info")
-    else:
-        flash("인증번호 발송에 실패했습니다. 다시 시도해 주세요.", "danger")
-
-    return redirect(url_for("suspect.auth", seal_id=seal_id))
+        return _respond(True, "인증번호가 이메일로 발송되었습니다. (유효시간 5분)", "info")
+    return _respond(False, "인증번호 발송에 실패했습니다. 다시 시도해 주세요.", "danger")
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +248,7 @@ def records(seal_id: str) -> Any:
         flash("본인 인증이 필요합니다.", "warning")
         return redirect(url_for("suspect.auth", seal_id=seal_id))
 
-    rows = find_seal_records_by_seal_id(seal_id)
+    rows = find_seal_record_summaries_by_seal_id(seal_id)
     records_list: list[dict[str, Any]] = []
     for row in rows:
         if isinstance(row, dict):
@@ -233,10 +261,34 @@ def records(seal_id: str) -> Any:
                 "seal_id": row[1],
                 "event_id": row[2],
                 "event_type": row[3],
-                "record_json": row[4],
-                "synced_at": row[6],
+                "synced_at": row[4],
             })
 
     return render_template(
         "records.html", seal_id=seal_id, records=records_list
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /suspect/records/<seal_id>/detail/<event_id>
+# ---------------------------------------------------------------------------
+@bp.route("/records/<seal_id>/detail/<int:event_id>")
+def record_detail(seal_id: str, event_id: int) -> Any:
+    """Return the record_json payload of a single seal record (JSON API).
+
+    Used by the records page modal to lazily load record details,
+    so the list view does not carry heavy JSON/PDF payloads.
+    """
+    if not session.get(f"auth_{seal_id}"):
+        return jsonify({"success": False, "message": "본인 인증이 필요합니다."}), 401
+
+    record_json = find_seal_record_json(seal_id, event_id)
+    if record_json is None:
+        return jsonify({"success": False, "message": "기록을 찾을 수 없습니다."}), 404
+
+    return jsonify({
+        "success": True,
+        "seal_id": seal_id,
+        "event_id": event_id,
+        "record_json": record_json,
+    })

@@ -177,6 +177,26 @@ class TestSyncUploadRecord:
         resp = client.post("/sync/upload-record", json=payload)
         assert resp.status_code == 400
 
+    def test_413_on_sync_returns_json(self, app: Any, client: Any) -> None:
+        """Regression: oversized sync body must get a JSON 413, not HTML.
+
+        Werkzeug's default 413 page is HTML, which breaks the sync
+        client's JSON contract.
+        """
+        app.config["MAX_CONTENT_LENGTH"] = 1024  # shrink limit for test
+        payload = {
+            "seal_id": "S-BIG-001",
+            "event_id": 1,
+            "event_type": "Sealing",
+            "record_json": json.dumps({"blob": "x" * 4096}),
+        }
+        resp = client.post("/sync/upload-record", json=payload)
+        assert resp.status_code == 413
+        data = resp.get_json()
+        assert data is not None, "413 response body must be JSON"
+        assert data["status"] == "error"
+        assert data["message"]
+
 
 # ===================================================================
 # Suspect records: auth required
@@ -240,6 +260,96 @@ class TestSuspectRecordsAuth:
         )
         assert resp.status_code == 302
         assert "/suspect/auth" in resp.headers.get("Location", "")
+
+
+# ===================================================================
+# Birth date format compatibility (regression)
+# ===================================================================
+
+class TestBirthDateFormatCompatibility:
+    """Legacy '19900101' vs date-input '1990-01-01' must both authenticate."""
+
+    def _register_case(
+        self, app: Any, seal_id: str, suspect_birth: str
+    ) -> None:
+        with app.app_context():
+            from web.models.db_models import insert_case
+
+            insert_case(
+                seal_id=seal_id,
+                case_number="2025-BIRTH-01",
+                investigator="수사관A",
+                suspect_name="홍길동",
+                suspect_birth=suspect_birth,
+                suspect_phone="010-1234-5678",
+                auth_level="basic",
+            )
+
+    def _auth_post(self, client: Any, seal_id: str, birth_date: str) -> Any:
+        with client.session_transaction() as sess:
+            sess["csrf_token"] = "test-token"
+        return client.post(
+            f"/suspect/auth/{seal_id}",
+            data={
+                "name": "홍길동",
+                "birth_date": birth_date,
+                "phone": "010-1234-5678",
+                "csrf_token": "test-token",
+            },
+            follow_redirects=False,
+        )
+
+    def test_legacy_stored_date_input_submitted(
+        self, app: Any, client: Any
+    ) -> None:
+        """DB: '19900101' (legacy), form: '1990-01-01' (type=date) -> success."""
+        self._register_case(app, "S-BIRTH-001", "19900101")
+        resp = self._auth_post(client, "S-BIRTH-001", "1990-01-01")
+        assert resp.status_code == 302  # redirect to upload-share = auth OK
+
+    def test_dashed_stored_legacy_submitted(
+        self, app: Any, client: Any
+    ) -> None:
+        """DB: '1990-01-01', form: '19900101' (reverse direction) -> success."""
+        self._register_case(app, "S-BIRTH-002", "1990-01-01")
+        resp = self._auth_post(client, "S-BIRTH-002", "19900101")
+        assert resp.status_code == 302
+
+    def test_wrong_birth_still_rejected(self, app: Any, client: Any) -> None:
+        self._register_case(app, "S-BIRTH-003", "19900101")
+        resp = self._auth_post(client, "S-BIRTH-003", "2000-01-01")
+        assert resp.status_code == 401
+
+    def test_register_case_normalizes_birth(
+        self, app: Any, client: Any
+    ) -> None:
+        """Registration stores the canonical YYYYMMDD form."""
+        with client.session_transaction() as sess:
+            sess["csrf_token"] = "test-token"
+
+        resp = client.post(
+            "/investigator/register-case",
+            data={
+                "seal_id": "S-BIRTH-REG",
+                "case_number": "2025-REG-01",
+                "investigator": "수사관A",
+                "suspect_name": "홍길동",
+                "suspect_birth": "1990-01-01",
+                "suspect_phone": "010-1234-5678",
+                "auth_level": "basic",
+                "csrf_token": "test-token",
+            },
+            follow_redirects=False,
+        )
+        assert resp.status_code == 302
+
+        with app.app_context():
+            from web.models.db_models import find_case_by_seal_id
+
+            row = find_case_by_seal_id("S-BIRTH-REG")
+            assert row is not None
+            birth = row["suspect_birth"] if not isinstance(row, tuple) else row[6]
+            assert birth == "19900101"
 
 
 # ===================================================================
