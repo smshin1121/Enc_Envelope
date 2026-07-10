@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Optional
@@ -53,6 +55,11 @@ CREATE TABLE IF NOT EXISTS certificates (
 );
 """
 
+_CREATE_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_seal_records_created_at
+    ON seal_records (created_at);
+"""
+
 
 # ---------------------------------------------------------------------------
 # Connection helper
@@ -89,9 +96,12 @@ def init_db(db_path: str) -> None:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     with _connect(db_path) as conn:
         conn.executescript(
-            _CREATE_SEAL_RECORDS + _CREATE_KEY_SHARES + _CREATE_CERTIFICATES
+            _CREATE_SEAL_RECORDS
+            + _CREATE_KEY_SHARES
+            + _CREATE_CERTIFICATES
+            + _CREATE_INDEXES
         )
-        _ensure_case_columns(conn)
+        _ensure_case_columns(conn, db_path, force=True)
     logger.info("DB 초기화 완료: %s", db_path)
 
 
@@ -190,8 +200,97 @@ def save_certificate(
     logger.info("인증서 저장: seal_id=%s", seal_id)
 
 
-def _ensure_case_columns(conn: sqlite3.Connection) -> None:
-    """Add search-optimized columns if they don't exist yet (migration)."""
+def save_seal_bundle(
+    db_path: str,
+    seal_id: str,
+    record_json: str,
+    pdf_path: str,
+    shares: dict[int, bytes],
+    cert_pem: str = "",
+    key_pem_encrypted: bytes = b"",
+) -> None:
+    """Persist a seal record, key shares, and certificate atomically.
+
+    All inserts run inside a single transaction so a failure in any
+    statement rolls back the whole bundle (no partial seal state).
+
+    Args:
+        db_path: Database file path.
+        seal_id: The seal identifier.
+        record_json: JSON-serialized seal record.
+        pdf_path: Absolute path to the generated PDF file.
+        shares: Mapping of share_index -> encrypted share bytes.
+        cert_pem: Optional PEM-encoded certificate. When empty the
+            certificate insert is skipped.
+        key_pem_encrypted: Encrypted private key bytes (required when
+            ``cert_pem`` is provided).
+    """
+    if not seal_id:
+        raise ValueError("seal_id는 비어 있을 수 없습니다.")
+    if not record_json:
+        raise ValueError("기록 JSON이 비어 있을 수 없습니다.")
+    if not shares:
+        raise ValueError("저장할 키 조각이 없습니다.")
+
+    try:
+        json.loads(record_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"유효하지 않은 JSON입니다: {exc}") from exc
+
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO seal_records (seal_id, record_json, pdf_path)
+            VALUES (?, ?, ?)
+            """,
+            (seal_id, record_json, pdf_path),
+        )
+        for idx, data in shares.items():
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO key_shares (seal_id, share_index, share_data)
+                VALUES (?, ?, ?)
+                """,
+                (seal_id, idx, data),
+            )
+        if cert_pem:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO certificates (seal_id, cert_pem, key_pem_encrypted)
+                VALUES (?, ?, ?)
+                """,
+                (seal_id, cert_pem, key_pem_encrypted),
+            )
+    logger.info(
+        "봉인 번들 저장 완료: seal_id=%s, shares=%s, cert=%s",
+        seal_id, list(shares.keys()), bool(cert_pem),
+    )
+
+
+# Databases whose seal_records table has already been migrated in this
+# process. Avoids re-running PRAGMA table_info on every query.
+_MIGRATED_DBS: set[str] = set()
+_MIGRATION_LOCK = threading.Lock()
+
+
+def _ensure_case_columns(
+    conn: sqlite3.Connection,
+    db_path: str = "",
+    *,
+    force: bool = False,
+) -> None:
+    """Add search-optimized columns if they don't exist yet (migration).
+
+    The migration check runs once per database path per process; later
+    calls are no-ops unless ``force`` is True (used by ``init_db`` so a
+    re-created database file is migrated again).
+    """
+    cache_key = os.path.abspath(db_path) if db_path else ""
+    if cache_key and not force:
+        with _MIGRATION_LOCK:
+            if cache_key in _MIGRATED_DBS:
+                return
+
     cursor = conn.execute("PRAGMA table_info(seal_records)")
     existing = {row["name"] for row in cursor.fetchall()}
     migrations: list[str] = []
@@ -208,6 +307,10 @@ def _ensure_case_columns(conn: sqlite3.Connection) -> None:
     for sql in migrations:
         conn.execute(sql)
 
+    if cache_key:
+        with _MIGRATION_LOCK:
+            _MIGRATED_DBS.add(cache_key)
+
 
 # ---------------------------------------------------------------------------
 # Case management queries
@@ -220,7 +323,7 @@ def list_all_cases(db_path: str) -> list[dict]:
     investigator, created_at, status, file_count.
     """
     with _connect(db_path) as conn:
-        _ensure_case_columns(conn)
+        _ensure_case_columns(conn, db_path)
         rows = conn.execute(
             """
             SELECT seal_id, case_number, suspect_name, investigator,
@@ -314,8 +417,7 @@ def get_case_artifacts(db_path: str, seal_id: str) -> list[dict]:
         return artifacts
 
     # Encrypted file
-    enc_info = record.get("encryption", {})
-    enc_path = enc_info.get("enc_filepath", "")
+    enc_path = _extract_enc_filepath(record, pdf_path or "")
     if enc_path:
         artifacts.append(_make_artifact(enc_path, "enc", created_at))
 
@@ -330,6 +432,36 @@ def get_case_artifacts(db_path: str, seal_id: str) -> list[dict]:
         artifacts.append(_make_artifact(key_path, "key", created_at))
 
     return artifacts
+
+
+def _extract_enc_filepath(record: dict, pdf_path: str) -> str:
+    """Extract the .enc file path from a record JSON.
+
+    Prefers the legacy flat ``encryption.enc_filepath`` key; falls back
+    to the canonical schema's ``file_info.result_files[0].filename``
+    (written by build_seal_record / ResealProcess). A bare basename is
+    resolved against the pdf_path parent directory — seal artifacts are
+    written to the same output directory as the PDF.
+    """
+    enc_info = record.get("encryption") or {}
+    if isinstance(enc_info, dict):
+        enc_path = enc_info.get("enc_filepath", "")
+        if enc_path:
+            return enc_path
+
+    file_info = record.get("file_info") or {}
+    result_files = file_info.get("result_files") or []
+    first = result_files[0] if result_files else {}
+    if not isinstance(first, dict):
+        return ""
+    name = first.get("filename", "")
+    if not name:
+        return ""
+    if Path(name).name != name:
+        return name  # already a (relative or absolute) path
+    if pdf_path:
+        return str(Path(pdf_path).parent / name)
+    return name
 
 
 def _make_artifact(file_path: str, file_type: str, created_at: str) -> dict:
@@ -378,7 +510,7 @@ def search_cases(db_path: str, keyword: str) -> list[dict]:
 
     kw = f"%{keyword.strip()}%"
     with _connect(db_path) as conn:
-        _ensure_case_columns(conn)
+        _ensure_case_columns(conn, db_path)
         rows = conn.execute(
             """
             SELECT seal_id, case_number, suspect_name, investigator,
@@ -458,7 +590,7 @@ def update_case_meta(
         raise ValueError("seal_id는 비어 있을 수 없습니다.")
 
     with _connect(db_path) as conn:
-        _ensure_case_columns(conn)
+        _ensure_case_columns(conn, db_path)
         if record_json or pdf_path:
             # Build dynamic SET clause to also update record_json / pdf_path
             params: list[str | bytes] = [case_number, suspect_name, investigator, status]
@@ -514,7 +646,7 @@ def create_case(
     })
 
     with _connect(db_path) as conn:
-        _ensure_case_columns(conn)
+        _ensure_case_columns(conn, db_path)
         conn.execute(
             """
             INSERT INTO seal_records
@@ -536,7 +668,7 @@ def get_case_for_seal(db_path: str, seal_id: str) -> Optional[dict]:
         raise ValueError("seal_id는 비어 있을 수 없습니다.")
 
     with _connect(db_path) as conn:
-        _ensure_case_columns(conn)
+        _ensure_case_columns(conn, db_path)
         row = conn.execute(
             """
             SELECT seal_id, case_number, suspect_name, investigator, record_json
@@ -598,9 +730,9 @@ def get_case_for_unseal(db_path: str, seal_id: str) -> Optional[dict]:
     except (json.JSONDecodeError, TypeError):
         record = {}
 
-    # Extract encryption info
-    enc_info = record.get("encryption", {})
-    result["enc_filepath"] = enc_info.get("enc_filepath", "")
+    # Extract encryption info (legacy flat key first, then canonical
+    # file_info.result_files fallback)
+    result["enc_filepath"] = _extract_enc_filepath(record, row["pdf_path"] or "")
 
     # Derive record JSON path from pdf_path
     pdf_path = row["pdf_path"] or ""
@@ -616,7 +748,7 @@ def get_case_for_unseal(db_path: str, seal_id: str) -> Optional[dict]:
 def get_sealable_cases(db_path: str) -> list[dict]:
     """Return cases that can be sealed (status is empty — pre-created cases)."""
     with _connect(db_path) as conn:
-        _ensure_case_columns(conn)
+        _ensure_case_columns(conn, db_path)
         rows = conn.execute(
             """
             SELECT seal_id, case_number, suspect_name, investigator, created_at, status
@@ -642,7 +774,7 @@ def get_sealable_cases(db_path: str) -> list[dict]:
 def get_unsealable_cases(db_path: str) -> list[dict]:
     """Return cases that can be unsealed (sealed but not yet unsealed)."""
     with _connect(db_path) as conn:
-        _ensure_case_columns(conn)
+        _ensure_case_columns(conn, db_path)
         rows = conn.execute(
             """
             SELECT seal_id, case_number, suspect_name, investigator, created_at, status
@@ -668,7 +800,7 @@ def get_unsealable_cases(db_path: str) -> list[dict]:
 def get_resealable_cases(db_path: str) -> list[dict]:
     """Return cases that can be resealed (unsealed, status contains U1)."""
     with _connect(db_path) as conn:
-        _ensure_case_columns(conn)
+        _ensure_case_columns(conn, db_path)
         rows = conn.execute(
             """
             SELECT seal_id, case_number, suspect_name, investigator, created_at, status
@@ -737,24 +869,25 @@ def get_dashboard_stats(db_path: str) -> dict:
 
     try:
         with _connect(db_path) as conn:
-            _ensure_case_columns(conn)
-            row = conn.execute("SELECT COUNT(*) AS cnt FROM seal_records").fetchone()
-            result["total"] = row["cnt"] if row else 0
-
+            _ensure_case_columns(conn, db_path)
             row = conn.execute(
-                "SELECT COUNT(*) AS cnt FROM seal_records WHERE status LIKE '%U0%' AND status LIKE '%R0%'"
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN status LIKE '%U0%' AND status LIKE '%R0%'
+                        THEN 1 ELSE 0 END) AS sealed_only,
+                    SUM(CASE WHEN status LIKE '%U%' AND status NOT LIKE '%U0%'
+                        THEN 1 ELSE 0 END) AS unsealed,
+                    SUM(CASE WHEN status LIKE '%R%' AND status NOT LIKE '%R0%'
+                        THEN 1 ELSE 0 END) AS resealed
+                FROM seal_records
+                """
             ).fetchone()
-            result["sealed_only"] = row["cnt"] if row else 0
-
-            row = conn.execute(
-                "SELECT COUNT(*) AS cnt FROM seal_records WHERE status LIKE '%U%' AND status NOT LIKE '%U0%'"
-            ).fetchone()
-            result["unsealed"] = row["cnt"] if row else 0
-
-            row = conn.execute(
-                "SELECT COUNT(*) AS cnt FROM seal_records WHERE status LIKE '%R%' AND status NOT LIKE '%R0%'"
-            ).fetchone()
-            result["resealed"] = row["cnt"] if row else 0
+            if row is not None:
+                result["total"] = row["total"] or 0
+                result["sealed_only"] = row["sealed_only"] or 0
+                result["unsealed"] = row["unsealed"] or 0
+                result["resealed"] = row["resealed"] or 0
     except Exception as exc:
         logger.warning("대시보드 통계 조회 실패: %s", exc)
 
@@ -771,7 +904,7 @@ def get_recent_cases(db_path: str, limit: int = 5) -> list[dict]:
 
     try:
         with _connect(db_path) as conn:
-            _ensure_case_columns(conn)
+            _ensure_case_columns(conn, db_path)
             rows = conn.execute(
                 """
                 SELECT seal_id, status, created_at
@@ -798,6 +931,7 @@ def get_expiring_seals(db_path: str, days: int = 3) -> list[dict]:
     """Return seals whose unlock_time is within N days from now.
 
     Parses ``unlock_time_iso`` from ``record_json``.
+    Falls back to legacy ``unlock_time`` for older records.
 
     Each dict contains: seal_id, unlock_time.
     """
@@ -825,7 +959,11 @@ def get_expiring_seals(db_path: str, days: int = 3) -> list[dict]:
         except (json.JSONDecodeError, TypeError):
             continue
 
-        unlock_str = record.get("unlock_time_iso", "")
+        unlock_str = (
+            record.get("unlock_time_iso")
+            or record.get("unlock_time")
+            or ""
+        )
         if not unlock_str:
             continue
 

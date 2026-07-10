@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import struct
+import tempfile
 from typing import Callable, Optional
 
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from .exceptions import DecryptionError, TamperDetectedError
-from .file_metadata import _compute_hashes
 from .types import DecryptionResult
 
 logger = logging.getLogger(__name__)
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 _OFFSET_SIZE = 8
 _META_SIZE_FIELD = 4
 _TAG_SIZE = 16
-_READ_BUFFER = 64 * 1024 * 1024  # 64 MB
+_STREAM_BUFFER = 8 * 1024 * 1024  # 8 MiB streaming buffer
 
 
 def decrypt_file(
@@ -31,21 +32,34 @@ def decrypt_file(
     """Decrypt an .enc file produced by encrypt_file.
 
     Reads metadata from file tail, decrypts each segment with its
-    nonce and verifies its auth tag. After full decryption, compares
-    MD5 and SHA-256 hashes against the originals stored in metadata.
+    nonce and verifies its auth tag. Segments are streamed in 8 MiB
+    buffers through an incremental GCM decryptor, and the plaintext
+    MD5/SHA-256 hashes are computed inline during the same pass, then
+    compared against the originals stored in metadata (no separate
+    hash pass over the output file).
+
+    Plaintext is written to a temporary file (restricted permissions,
+    same directory) and only moved to the final path via an atomic
+    ``os.replace`` after ALL segment auth tags verified and the hash
+    comparison passed. Tampered or cancelled decryptions never leave
+    plaintext at the final output path.
 
     Args:
         enc_filepath: Path to the .enc file.
         aes_key: 32-byte AES-256 key.
         output_dir: Directory to write the decrypted file.
-        progress_cb: Optional callback(completed_bytes, total_bytes).
+        progress_cb: Optional callback(completed_bytes, total_bytes),
+            invoked per 8 MiB buffer (byte-level progress). Raising an
+            exception from the callback cancels the decryption.
 
     Returns:
         DecryptionResult with verification details.
 
     Raises:
         DecryptionError: On decryption failure.
-        TamperDetectedError: If any auth tag verification fails.
+        TamperDetectedError: If any auth tag verification fails or the
+            recovered plaintext hashes do not match the originals
+            stored in metadata.
     """
     _validate_inputs(enc_filepath, aes_key, output_dir)
 
@@ -56,33 +70,57 @@ def decrypt_file(
     tags = [bytes.fromhex(t) for t in meta["tags"]]
     chunk_lengths = meta["chunk_lengths"]
     num_chunks = len(nonces)
-    total_encrypted_size = sum(cl + _TAG_SIZE for cl in chunk_lengths)
+
+    md5 = hashlib.md5()
+    sha256 = hashlib.sha256()
+
+    # Write plaintext to a temp file in the SAME directory (so the
+    # final os.replace is atomic on the same filesystem). mkstemp
+    # creates it with restricted permissions (0600 where supported).
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        prefix=meta["filename"] + ".", suffix=".part", dir=output_dir
+    )
+    os.close(tmp_fd)
 
     try:
-        aesgcm = AESGCM(aes_key)
-
         _decrypt_chunks(
             enc_filepath=enc_filepath,
-            output_path=output_path,
-            aesgcm=aesgcm,
+            output_path=tmp_path,
+            aes_key=aes_key,
             nonces=nonces,
             tags=tags,
             chunk_lengths=chunk_lengths,
             num_chunks=num_chunks,
             total_original_size=meta["size"],
+            hashers=(md5, sha256),
             progress_cb=progress_cb,
         )
+
+        # Verify hashes computed inline during decryption BEFORE the
+        # plaintext is exposed at the final path.
+        md5_match, sha256_match = _compare_hashes(
+            md5.hexdigest(),
+            sha256.hexdigest(),
+            meta.get("hash_before_md5"),
+            meta.get("hash_before_sha256"),
+        )
+        if not (md5_match and sha256_match):
+            raise TamperDetectedError(
+                "Plaintext hash mismatch against metadata: "
+                "data or metadata may have been tampered with"
+            )
+
+        # All tags verified + hashes match — atomically publish.
+        os.replace(tmp_path, output_path)
     except TamperDetectedError:
-        _cleanup_partial(output_path)
+        _cleanup_partial(tmp_path)
+        raise
+    except DecryptionError:
+        _cleanup_partial(tmp_path)
         raise
     except Exception as exc:
-        _cleanup_partial(output_path)
+        _cleanup_partial(tmp_path)
         raise DecryptionError(f"Decryption failed: {exc}") from exc
-
-    # Verify hashes
-    md5_match, sha256_match = _verify_hashes(
-        output_path, meta.get("hash_before_md5"), meta.get("hash_before_sha256")
-    )
 
     return DecryptionResult(
         output_filepath=output_path,
@@ -153,15 +191,22 @@ def _decrypt_chunks(
     *,
     enc_filepath: str,
     output_path: str,
-    aesgcm: AESGCM,
+    aes_key: bytes,
     nonces: list[bytes],
     tags: list[bytes],
     chunk_lengths: list[int],
     num_chunks: int,
     total_original_size: int,
+    hashers: Optional[tuple[hashlib._Hash, hashlib._Hash]],
     progress_cb: Optional[Callable[[int, int], None]],
 ) -> None:
-    """Decrypt all chunks and write to output file."""
+    """Decrypt all chunks and write to output file, streaming buffers.
+
+    Each chunk is decrypted with an incremental GCM decryptor bound to
+    the stored (nonce, tag) pair; ``finalize()`` performs the GCM tag
+    verification. The tag read from the file is additionally compared
+    against the stored tag to detect tampering of the trailing bytes.
+    """
     completed_bytes = 0
 
     with open(enc_filepath, "rb") as src:
@@ -169,12 +214,33 @@ def _decrypt_chunks(
 
         with open(output_path, "wb") as dst:
             for i in range(num_chunks):
-                ct_len = chunk_lengths[i] + _TAG_SIZE
-                ciphertext_with_tag = _read_exact(src, ct_len)
-
-                # Verify the stored tag matches
                 stored_tag = tags[i]
-                actual_tag = ciphertext_with_tag[-_TAG_SIZE:]
+                decryptor = Cipher(
+                    algorithms.AES(aes_key), modes.GCM(nonces[i], stored_tag)
+                ).decryptor()
+
+                remaining = chunk_lengths[i]
+                while remaining > 0:
+                    to_read = min(_STREAM_BUFFER, remaining)
+                    ciphertext = src.read(to_read)
+                    if not ciphertext:
+                        raise DecryptionError(
+                            f"Unexpected EOF in chunk {i} of {enc_filepath}"
+                        )
+                    plaintext = decryptor.update(ciphertext)
+                    if hashers is not None:
+                        hashers[0].update(plaintext)
+                        hashers[1].update(plaintext)
+                    dst.write(plaintext)
+                    completed_bytes += len(plaintext)
+                    remaining -= len(ciphertext)
+
+                    # Byte-level progress + cancellation point (mid-chunk)
+                    if remaining > 0 and progress_cb is not None:
+                        progress_cb(completed_bytes, total_original_size)
+
+                # Verify the stored tag matches the tag in the file
+                actual_tag = src.read(_TAG_SIZE)
                 if actual_tag != stored_tag:
                     raise TamperDetectedError(
                         f"Auth tag mismatch at chunk {i}: "
@@ -182,29 +248,29 @@ def _decrypt_chunks(
                     )
 
                 try:
-                    plaintext = aesgcm.decrypt(
-                        nonces[i], ciphertext_with_tag, None
-                    )
+                    final = decryptor.finalize()
                 except Exception as exc:
                     raise TamperDetectedError(
                         f"GCM decryption failed at chunk {i}: {exc}"
                     ) from exc
-
-                dst.write(plaintext)
-                completed_bytes += len(plaintext)
+                if final:
+                    if hashers is not None:
+                        hashers[0].update(final)
+                        hashers[1].update(final)
+                    dst.write(final)
+                    completed_bytes += len(final)
 
                 if progress_cb is not None:
                     progress_cb(completed_bytes, total_original_size)
 
 
-def _verify_hashes(
-    filepath: str,
+def _compare_hashes(
+    actual_md5: str,
+    actual_sha256: str,
     expected_md5: Optional[str],
     expected_sha256: Optional[str],
 ) -> tuple[bool, bool]:
-    """Verify MD5 and SHA-256 hashes of the decrypted file."""
-    actual_md5, actual_sha256 = _compute_hashes(filepath)
-
+    """Compare inline-computed hashes against the expected originals."""
     md5_match = (expected_md5 is None) or (actual_md5 == expected_md5)
     sha256_match = (expected_sha256 is None) or (actual_sha256 == expected_sha256)
 
@@ -219,20 +285,6 @@ def _verify_hashes(
         )
 
     return md5_match, sha256_match
-
-
-def _read_exact(f, size: int) -> bytes:
-    """Read exactly `size` bytes from file."""
-    parts: list[bytes] = []
-    remaining = size
-    while remaining > 0:
-        to_read = min(_READ_BUFFER, remaining)
-        data = f.read(to_read)
-        if not data:
-            break
-        parts.append(data)
-        remaining -= len(data)
-    return b"".join(parts)
 
 
 def _cleanup_partial(path: str) -> None:

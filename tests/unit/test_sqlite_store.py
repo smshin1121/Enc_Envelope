@@ -15,12 +15,15 @@ import sqlite3
 import pytest
 
 from desktop.db.sqlite_store import (
+    get_dashboard_stats,
     get_key_share,
     get_seal_record,
     init_db,
     save_certificate,
     save_key_shares,
+    save_seal_bundle,
     save_seal_record,
+    update_case_meta,
 )
 
 
@@ -214,3 +217,121 @@ class TestDuplicateSealId:
         conn.close()
 
         assert row["cert_pem"] == "CERT-V2"
+
+
+# ---------------------------------------------------------------------------
+# Tests: save_seal_bundle (single-transaction persistence)
+# ---------------------------------------------------------------------------
+
+
+class TestSaveSealBundle:
+    """save_seal_bundle persists record + shares + cert atomically."""
+
+    def test_bundle_round_trip(self, db_path: str) -> None:
+        seal_id = "S-20260401-ABC123"
+        shares = {3: b"share3", 4: b"share4"}
+
+        save_seal_bundle(
+            db_path, seal_id, _sample_record_json(), "/tmp/r.pdf",
+            shares=shares, cert_pem="CERT", key_pem_encrypted=b"KEY",
+        )
+
+        record = get_seal_record(db_path, seal_id)
+        assert record is not None
+        assert record["pdf_path"] == "/tmp/r.pdf"
+        assert get_key_share(db_path, seal_id, 3) == b"share3"
+        assert get_key_share(db_path, seal_id, 4) == b"share4"
+
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT cert_pem FROM certificates WHERE seal_id = ?",
+            (seal_id,),
+        ).fetchone()
+        conn.close()
+        assert row["cert_pem"] == "CERT"
+
+    def test_bundle_without_certificate(self, db_path: str) -> None:
+        seal_id = "S-20260401-NOCERT"
+        save_seal_bundle(
+            db_path, seal_id, _sample_record_json(), "/tmp/r.pdf",
+            shares={3: b"s3"},
+        )
+
+        conn = sqlite3.connect(db_path)
+        count = conn.execute(
+            "SELECT COUNT(*) FROM certificates WHERE seal_id = ?",
+            (seal_id,),
+        ).fetchone()[0]
+        conn.close()
+        assert count == 0
+        assert get_key_share(db_path, seal_id, 3) == b"s3"
+
+    def test_bundle_validation(self, db_path: str) -> None:
+        with pytest.raises(ValueError, match="seal_id"):
+            save_seal_bundle(db_path, "", "{}", "/x.pdf", shares={3: b"d"})
+        with pytest.raises(ValueError, match="JSON"):
+            save_seal_bundle(
+                db_path, "S-1", "not-json", "/x.pdf", shares={3: b"d"},
+            )
+        with pytest.raises(ValueError):
+            save_seal_bundle(db_path, "S-1", "{}", "/x.pdf", shares={})
+
+    def test_bundle_is_atomic_on_failure(self, db_path: str) -> None:
+        """A failing statement must roll back the whole bundle."""
+        seal_id = "S-20260401-ATOMIC"
+        # share_data has a NOT NULL constraint -> None triggers failure
+        bad_shares = {3: b"ok", 4: None}
+
+        with pytest.raises(Exception):
+            save_seal_bundle(
+                db_path, seal_id, _sample_record_json(), "/tmp/r.pdf",
+                shares=bad_shares,  # type: ignore[arg-type]
+            )
+
+        # Nothing from the bundle may have been persisted
+        assert get_seal_record(db_path, seal_id) is None
+        assert get_key_share(db_path, seal_id, 3) is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: dashboard stats (single aggregated query)
+# ---------------------------------------------------------------------------
+
+
+class TestDashboardStats:
+    """get_dashboard_stats must aggregate statuses correctly."""
+
+    def test_empty_db(self, db_path: str) -> None:
+        stats = get_dashboard_stats(db_path)
+        assert stats == {
+            "total": 0, "sealed_only": 0, "unsealed": 0, "resealed": 0,
+        }
+
+    def test_counts_by_status(self, db_path: str) -> None:
+        cases = [
+            ("S-A", "S1U0R0"),  # sealed only
+            ("S-B", "S1U0R0"),  # sealed only
+            ("S-C", "S1U1R0"),  # unsealed
+            ("S-D", "S1U1R1"),  # unsealed + resealed
+        ]
+        for seal_id, status in cases:
+            save_seal_record(db_path, seal_id, "{}", "/x.pdf")
+            update_case_meta(db_path, seal_id, status=status)
+
+        stats = get_dashboard_stats(db_path)
+        assert stats["total"] == 4
+        assert stats["sealed_only"] == 2
+        assert stats["unsealed"] == 2
+        assert stats["resealed"] == 1
+
+    def test_created_at_index_exists(self, db_path: str) -> None:
+        conn = sqlite3.connect(db_path)
+        indexes = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+        conn.close()
+        assert "idx_seal_records_created_at" in indexes

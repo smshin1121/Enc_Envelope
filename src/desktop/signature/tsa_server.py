@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import threading
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
 
@@ -27,6 +27,10 @@ logger = logging.getLogger(__name__)
 
 # TSA policy OID (custom for this system)
 _TSA_POLICY_OID = "1.2.3.4.5.6.7.8.9"
+_DEFAULT_TSA_DIR = Path.home() / ".enc_envelope" / "tsa"
+_DEFAULT_TSA_PASSWORD = "tsa-default-password"
+_SERVER_LOCK = threading.Lock()
+_RUNNING_SERVERS: dict[tuple[str, int], tuple[HTTPServer, threading.Thread]] = {}
 
 
 class _SerialCounter:
@@ -62,6 +66,7 @@ def _build_tst_info(
     message_imprint: tsp.MessageImprint,
     serial_number: int,
     gen_time: datetime,
+    nonce: int | None = None,
 ) -> tsp.TSTInfo:
     """Build a TSTInfo structure.
 
@@ -73,7 +78,7 @@ def _build_tst_info(
     Returns:
         TSTInfo ASN.1 structure.
     """
-    return tsp.TSTInfo({
+    tst_info = {
         "version": "v1",
         "policy": _TSA_POLICY_OID,
         "message_imprint": message_imprint,
@@ -83,7 +88,10 @@ def _build_tst_info(
             "seconds": 1,
         }),
         "ordering": False,
-    })
+    }
+    if nonce is not None:
+        tst_info["nonce"] = nonce
+    return tsp.TSTInfo(tst_info)
 
 
 def _sign_tst_info(
@@ -178,10 +186,11 @@ def _process_tsq(tsq_bytes: bytes, ctx: _TSAContext) -> bytes:
         return _build_error_tsr("bad_request")
 
     message_imprint = tsq["message_imprint"]
+    nonce = tsq["nonce"].native if "nonce" in tsq and tsq["nonce"].native is not None else None
     serial = ctx.serial_counter.next()
     gen_time = datetime.now(timezone.utc)
 
-    tst_info = _build_tst_info(message_imprint, serial, gen_time)
+    tst_info = _build_tst_info(message_imprint, serial, gen_time, nonce=nonce)
     tst_info_bytes = tst_info.dump()
 
     try:
@@ -337,7 +346,9 @@ def create_tsa_server(
     )
 
     try:
-        server = HTTPServer((host, port), handler_class)
+        # ThreadingHTTPServer handles each request on its own daemon
+        # thread so concurrent TSQ requests don't serialize.
+        server = ThreadingHTTPServer((host, port), handler_class)
         logger.info("TSA server created at http://%s:%d/tsa", host, port)
         return server
     except Exception as exc:
@@ -402,3 +413,67 @@ def start_tsa_server_background(
     thread.start()
     logger.info("TSA server started in background on http://%s:%d/tsa", host, port)
     return server, thread
+
+
+def ensure_tsa_credentials(
+    tsa_dir: str | Path | None = None,
+    *,
+    ca_key_password: str = "ca-default-password",
+    tsa_key_password: str = _DEFAULT_TSA_PASSWORD,
+) -> tuple[Path, Path]:
+    """Create TSA credentials on first run and return their paths."""
+    from .ca_setup import create_ca, issue_tsa_cert, save_tsa_credentials
+
+    base_dir = Path(tsa_dir) if tsa_dir is not None else _DEFAULT_TSA_DIR
+    key_path = base_dir / "tsa_key.pem"
+    cert_path = base_dir / "tsa_cert.pem"
+
+    if key_path.exists() and cert_path.exists():
+        return key_path, cert_path
+
+    ca_dir = base_dir / "ca"
+    ca_key, ca_cert = create_ca(ca_dir, ca_key_password=ca_key_password)
+    tsa_key, tsa_cert = issue_tsa_cert(ca_key, ca_cert)
+    save_tsa_credentials(
+        tsa_key,
+        tsa_cert,
+        base_dir,
+        key_password=tsa_key_password,
+    )
+    return key_path, cert_path
+
+
+def ensure_tsa_server_running(
+    tsa_dir: str | Path | None = None,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 3161,
+    ca_key_password: str = "ca-default-password",
+    tsa_key_password: str = _DEFAULT_TSA_PASSWORD,
+) -> tuple[str, Path]:
+    """Ensure a local TSA server is running and return its URL and cert path."""
+    key_path, cert_path = ensure_tsa_credentials(
+        tsa_dir,
+        ca_key_password=ca_key_password,
+        tsa_key_password=tsa_key_password,
+    )
+    server_key = (host, port)
+
+    with _SERVER_LOCK:
+        running = _RUNNING_SERVERS.get(server_key)
+        if running is not None:
+            server, thread = running
+            if thread.is_alive():
+                return f"http://{host}:{port}/tsa", cert_path
+            _RUNNING_SERVERS.pop(server_key, None)
+
+        server, thread = start_tsa_server_background(
+            tsa_key_path=key_path,
+            tsa_cert_path=cert_path,
+            key_password=tsa_key_password,
+            host=host,
+            port=port,
+        )
+        _RUNNING_SERVERS[server_key] = (server, thread)
+
+    return f"http://{host}:{port}/tsa", cert_path

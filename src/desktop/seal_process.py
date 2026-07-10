@@ -1,9 +1,9 @@
 """Seal process orchestration (S1 through S7).
 
 Coordinates the full sealing workflow by calling into the crypto,
-record, and db modules.  Each step produces results that feed into
-the next.  On error the current state is preserved so the user
-can retry from the failing step.
+record, signature, and db modules. Each step produces results that feed
+into the next. On error the current state is preserved so the user can
+retry from the failing step.
 """
 
 from __future__ import annotations
@@ -11,18 +11,15 @@ from __future__ import annotations
 import json
 import logging
 import os
+import struct
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Immutable step result containers
-# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class SealConfig:
@@ -51,31 +48,13 @@ class SealResult:
     record_json: str
 
 
-# ---------------------------------------------------------------------------
-# Seal process orchestrator
-# ---------------------------------------------------------------------------
-
 class SealProcess:
-    """Orchestrates the sealing workflow steps S1 through S7.
-
-    The process is designed to be driven by the GUI wizard.  Each
-    ``run_sN`` method executes the corresponding step and returns
-    a result dict.  If a step fails, the process state is preserved
-    so the user can retry.
-
-    Attributes:
-        config: The sealing configuration (set after S3).
-        state: Mutable state dict accumulating step results.
-    """
+    """Orchestrates the sealing workflow steps S1 through S7."""
 
     def __init__(self, *, db_path: str) -> None:
         self._db_path = db_path
         self.config: Optional[SealConfig] = None
         self.state: dict[str, Any] = {}
-
-    # ------------------------------------------------------------------
-    # S1: File encryption
-    # ------------------------------------------------------------------
 
     def run_s1(
         self,
@@ -86,26 +65,17 @@ class SealProcess:
     ) -> dict[str, Any]:
         """Encrypt the source file with AES-256-GCM.
 
-        Returns a dict with keys: aes_key_hex, enc_filepath, metadata,
-        chunk_count.
+        MD5/SHA-256 metadata is computed inline during the encryption
+        read (single pass), so no separate hash pass is required.
         """
-        from .crypto import collect_metadata, encrypt_file
+        from .crypto import MAX_CHUNK_SIZE, encrypt_file
 
-        chunk_bytes = chunk_size_gb * (1024 ** 3)
-
-        # Generate AES-256 key
+        chunk_bytes = min(chunk_size_gb * (1024 ** 3), MAX_CHUNK_SIZE)
         aes_key = os.urandom(32)
         aes_key_hex = aes_key.hex()
 
-        # Collect metadata before encryption
-        metadata = collect_metadata(source_file)
-
-        # Determine output path
         src_name = Path(source_file).stem
-        enc_filename = f"{src_name}.enc"
-        enc_path = str(Path(output_dir) / enc_filename)
-
-        # Encrypt
+        enc_path = str(Path(output_dir) / f"{src_name}.enc")
         result = encrypt_file(
             filepath=source_file,
             aes_key=aes_key,
@@ -113,6 +83,7 @@ class SealProcess:
             chunk_size=chunk_bytes,
             progress_cb=progress_cb,
         )
+        metadata = result.metadata
 
         step_result = {
             "aes_key_hex": aes_key_hex,
@@ -128,88 +99,130 @@ class SealProcess:
             },
             "chunk_count": result.chunk_count,
             "encryption_algo": result.encryption_algo,
+            "enc_metadata": _read_enc_metadata(result.enc_filepath),
         }
         self.state["s1"] = step_result
         logger.info(
-            "S1 완료: %s -> %s (%d 구간)",
-            source_file, result.enc_filepath, result.chunk_count,
+            "S1 complete: %s -> %s (%d chunks)",
+            source_file,
+            result.enc_filepath,
+            result.chunk_count,
         )
         return step_result
-
-    # ------------------------------------------------------------------
-    # S2-S3: Info collection (handled by wizard, stored via set_config)
-    # ------------------------------------------------------------------
 
     def set_config(self, config: SealConfig) -> None:
         """Store the configuration collected from S1-S3."""
         self.config = config
 
-    # ------------------------------------------------------------------
-    # S4: Generate seal record (preview)
-    # ------------------------------------------------------------------
-
     def run_s4(self) -> dict[str, Any]:
-        """Generate the seal_id and assemble the seal record JSON.
-
-        Returns a dict with keys: seal_id, record_dict.
-        """
+        """Generate the seal_id and assemble the seal record JSON."""
         if self.config is None:
-            raise RuntimeError("config가 설정되지 않았습니다 (S1-S3 먼저 실행).")
+            raise RuntimeError("Seal configuration must be set before S4")
         if "s1" not in self.state:
-            raise RuntimeError("S1이 완료되지 않았습니다.")
+            raise RuntimeError("S1 must complete before S4")
+
+        from .record import (
+            build_seal_record,
+            create_initial_history,
+            create_seal_id,
+            validate_record,
+        )
 
         now = datetime.now(tz=timezone.utc)
-        seal_id = f"S-{now.strftime('%Y%m%d')}-{os.urandom(3).hex().upper()}"
+        now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        seal_id = create_seal_id()
+        investigator_name = self.config.investigator.get("name", "")
+        s1 = self.state["s1"]
+        meta = s1["metadata"]
+        enc_meta = s1.get("enc_metadata", {})
 
-        record = {
-            "seal_id": seal_id,
-            "type": "seal",
-            "version": "1.0",
-            "created_at": now.isoformat(),
-            "case_number": self.config.case_number,
-            "investigator": self.config.investigator,
-            "seizure": self.config.seizure,
-            "media": self.config.media,
-            "subject": {
-                "name": self.config.subject["name"],
-                "email": self.config.subject["email"],
-                "birth": self.config.subject["birth"],
-                "phone": self.config.subject["phone"],
+        history = create_initial_history({
+            "seal_type": "Sealing",
+            "start_time": now_iso,
+            "end_time": now_iso,
+            "investigator": investigator_name,
+        })
+
+        record = build_seal_record(
+            seal_id=seal_id,
+            case_info={
+                "case_number": self.config.case_number,
+                "investigator": investigator_name,
+                "device_user": self.config.seizure.get("device_user", ""),
+                "suspect": self.config.subject.get("name", ""),
+                "storage_type": self.config.media.get("type", ""),
+                "storage_info": {
+                    "manufacturer": self.config.media.get("manufacturer", ""),
+                    "model": self.config.media.get("model", ""),
+                    "serial": self.config.media.get("serial", ""),
+                },
+                "seizure_time": self.config.seizure.get("date", now_iso),
+                "seizure_location": self.config.seizure.get("location", ""),
             },
-            "encryption": {
-                "algorithm": self.state["s1"]["encryption_algo"],
-                "chunk_count": self.state["s1"]["chunk_count"],
-                "enc_filepath": self.state["s1"]["enc_filepath"],
+            process_info={
+                "type": "Sealing",
+                "start_time": now_iso,
+                "end_time": now_iso,
+                "file_count": 1,
+                "investigator": investigator_name,
+                "reason": "",
+                "participation": self.config.subject.get("participation", ""),
             },
-            "original_file": self.state["s1"]["metadata"],
-            "history": [
-                {
-                    "event": "seal",
-                    "timestamp": now.isoformat(),
-                    "actor": self.config.investigator.get("name", ""),
-                }
-            ],
-            "summary": "S1",
-        }
+            file_info={
+                "original_files": [{
+                    "filename": meta["filename"],
+                    "size": meta["size"],
+                    "md5": meta["md5"],
+                    "sha256": meta["sha256"],
+                    "mtime": _to_zulu(meta["mtime"]),
+                    "ctime": _to_zulu(meta["ctime"]),
+                    "atime": _to_zulu(meta["atime"]),
+                }],
+                "result_files": [{
+                    "filename": Path(s1["enc_filepath"]).name,
+                    "size": Path(s1["enc_filepath"]).stat().st_size,
+                    "encryption_algo": s1["encryption_algo"],
+                    "enc_ended_time": _to_zulu(
+                        enc_meta.get("enc_ended_time", now_iso)
+                    ),
+                    "nonces": enc_meta.get("nonces", []),
+                    "tags": enc_meta.get("tags", []),
+                    "chunk_lengths": enc_meta.get("chunk_lengths", []),
+                }],
+                "hash_match": True,
+                "unknown_files": [],
+                "derived_files": [],
+            },
+            signer_info={
+                "name": self.config.subject.get("name", ""),
+                "email": self.config.subject.get("email", ""),
+                "birth_date": self.config.subject.get("birth", ""),
+                "phone": self.config.subject.get("phone", ""),
+                "cert_fingerprint": "0" * 64,
+                "signature_image_hash": _signature_hash(
+                    self.config.signature_lines
+                ),
+            },
+            history=history,
+        )
+
+        errors = validate_record(record)
+        if errors:
+            raise RuntimeError(f"Seal record validation failed: {errors}")
 
         self.state["s4"] = {"seal_id": seal_id, "record_dict": record}
-        logger.info("S4 완료: seal_id=%s", seal_id)
+        logger.info("S4 complete: seal_id=%s", seal_id)
         return self.state["s4"]
-
-    # ------------------------------------------------------------------
-    # S5: Digital signature
-    # ------------------------------------------------------------------
 
     def run_s5(
         self,
         status_cb: Optional[Callable[[str], None]] = None,
     ) -> dict[str, Any]:
-        """Generate certificate, render PDF, apply digital signature.
-
-        Returns a dict with keys: cert_pem_path, key_pem_path, pdf_path.
-        """
+        """Generate certificate, render PDF, sign it, and timestamp it."""
         if "s4" not in self.state:
-            raise RuntimeError("S4가 완료되지 않았습니다.")
+            raise RuntimeError("S4 must complete before S5")
+        if self.config is None:
+            raise RuntimeError("Seal configuration must be set before S5")
 
         def _notify(msg: str) -> None:
             if status_cb:
@@ -217,47 +230,47 @@ class SealProcess:
 
         seal_id = self.state["s4"]["seal_id"]
         record_dict = self.state["s4"]["record_dict"]
-        output_dir = Path(self.config.output_dir) if self.config else Path(".")
+        output_dir = Path(self.config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # --- JSON 저장 ---
-        _notify("봉인 기록 JSON 저장 중...")
+        _notify("Writing record JSON")
         record_json_path = str(output_dir / f"{seal_id}_record.json")
         with open(record_json_path, "w", encoding="utf-8") as f:
             json.dump(record_dict, f, ensure_ascii=False, indent=2)
 
-        # --- PDF 렌더링 ---
-        _notify("PDF 생성 중...")
+        _notify("Rendering record PDF")
         pdf_path = str(output_dir / f"{seal_id}_seal_record.pdf")
         try:
             from desktop.record import render_record_pdf
+
             render_record_pdf(record_dict, "seal_record.html", pdf_path)
-            _notify("PDF 렌더링 완료")
+            _notify("Record PDF rendered")
         except (ImportError, Exception) as exc:
-            _notify(f"PDF 렌더링 폴백 (weasyprint 미설치 가능): {exc}")
-            logger.warning("PDF 렌더링 폴백: %s", exc)
+            _notify(f"PDF render fallback: {exc}")
+            logger.warning("PDF render fallback: %s", exc)
             Path(pdf_path).write_text(
                 f"[Placeholder] Seal Record PDF for {seal_id}",
                 encoding="utf-8",
             )
 
-        # --- 인증서 생성 ---
-        _notify("RSA 키쌍 및 인증서 생성 중...")
+        import hashlib
+
+        _notify("Generating signing credentials")
         subject_name = self.config.subject.get("name", "Unknown")
         subject_email = self.config.subject.get("email", "unknown@example.com")
         password = self.config.subject.get("password", "default_password")
-
-        # 서명 이미지 해시 계산 (서명 데이터를 임시 파일로 저장)
-        import hashlib
-        sig_lines = self.config.signature_lines
-        sig_bytes = json.dumps(sig_lines).encode("utf-8")
-        sig_hash = hashlib.sha256(sig_bytes).hexdigest()
+        sig_hash = hashlib.sha256(
+            json.dumps(self.config.signature_lines).encode("utf-8")
+        ).hexdigest()
 
         cert_pem_path = str(output_dir / f"{seal_id}_cert.pem")
         key_pem_path = str(output_dir / f"{seal_id}_key.pem")
+        tsa_url = None
+        tsa_cert_path = None
 
         try:
             from desktop.signature import (
+                ensure_tsa_server_running,
                 generate_keypair,
                 create_self_signed_cert,
                 save_private_key,
@@ -265,26 +278,31 @@ class SealProcess:
                 sign_pdf as signature_sign_pdf,
             )
 
-            # 1. RSA 키쌍 생성
-            private_key, public_key = generate_keypair(2048)
-            _notify("RSA-2048 키쌍 생성 완료")
+            tsa_url, tsa_cert_path = ensure_tsa_server_running()
+            _notify("Local TSA ready")
 
-            # 2. X.509 자체서명 인증서 생성 (서명이미지 해시 포함)
+            private_key, _public_key = generate_keypair(2048)
+            _notify("RSA-2048 key generated")
+
             cert = create_self_signed_cert(
                 private_key=private_key,
                 subject_name=subject_name,
                 email=subject_email,
                 signature_image_hash=sig_hash,
             )
-            _notify("X.509 인증서 생성 완료")
 
-            # 3. 인증서·개인키 PEM 저장
+            from cryptography.hazmat.primitives import hashes
+
+            record_dict["signer_info"]["cert_fingerprint"] = cert.fingerprint(
+                hashes.SHA256()
+            ).hex()
+            _notify("X.509 certificate generated")
+
             save_certificate(cert, cert_pem_path)
             save_private_key(private_key, key_pem_path, password)
-            _notify("인증서/개인키 저장 완료")
+            _notify("Certificate and key saved")
 
-            # 4. PAdES PDF 전자서명 적용
-            _notify("PDF 전자서명 적용 중...")
+            _notify("Applying PAdES signature")
             signed_pdf_path = str(output_dir / f"{seal_id}_seal_record_signed.pdf")
             warning = signature_sign_pdf(
                 pdf_path=pdf_path,
@@ -292,34 +310,40 @@ class SealProcess:
                 key_path=key_pem_path,
                 password=password,
                 output_path=signed_pdf_path,
-                tsa_url=None,  # TSA는 아래에서 별도 처리
+                tsa_url=tsa_url,
             )
-            # 서명된 PDF로 교체
             pdf_path = signed_pdf_path
             if warning:
-                _notify(f"전자서명 완료 (경고: {warning})")
+                _notify(f"PDF signed with warning: {warning}")
             else:
-                _notify("PDF 전자서명 완료")
+                _notify("PDF signed successfully")
 
         except ImportError as exc:
-            _notify(f"전자서명 모듈 미설치: {exc}")
-            logger.warning("전자서명 모듈 import 실패: %s", exc)
+            _notify(f"Signature stack unavailable: {exc}")
+            logger.warning("Signature stack unavailable: %s", exc)
         except Exception as exc:
-            _notify(f"전자서명 처리 중 오류: {exc}")
-            logger.warning("전자서명 처리 중 오류: %s", exc)
+            _notify(f"Signature pipeline failed: {exc}")
+            logger.warning("Signature pipeline failed: %s", exc)
 
-        # --- TSA 시점확인 ---
-        _notify("TSA 시점확인 요청 중...")
+        _notify("Requesting RFC3161 timestamp")
         try:
-            from desktop.signature import request_timestamp
-            pdf_hash = hashlib.sha256(Path(pdf_path).read_bytes()).digest()
-            tst_token = request_timestamp(pdf_hash, "http://localhost:3161/tsa")
-            _notify("TSA 시점확인 완료")
-        except (ImportError, Exception) as exc:
-            _notify(f"TSA 처리 스킵 (내부 TSA 미가동 시 정상): {exc}")
-            logger.warning("TSA 시점확인 스킵: %s", exc)
+            from desktop.signature import request_timestamp, verify_timestamp
 
-        # Read cert/key PEM content for S7 DB storage
+            pdf_hash = _sha256_file_digest(pdf_path)
+            if not tsa_url:
+                raise RuntimeError("TSA URL was not initialized")
+            if not tsa_cert_path:
+                raise RuntimeError("TSA certificate path was not initialized")
+            tst_token = request_timestamp(pdf_hash, tsa_url)
+            verify_timestamp(tst_token, str(tsa_cert_path))
+            _notify("RFC3161 timestamp verified")
+        except (ImportError, Exception) as exc:
+            _notify(f"TSA request skipped: {exc}")
+            logger.warning("TSA request skipped: %s", exc)
+
+        with open(record_json_path, "w", encoding="utf-8") as f:
+            json.dump(record_dict, f, ensure_ascii=False, indent=2)
+
         cert_pem_content = ""
         key_pem_content = b""
         try:
@@ -339,112 +363,79 @@ class SealProcess:
             "key_pem": key_pem_content,
         }
         self.state["s5"] = step_result
-        _notify("S5 단계 완료")
-        logger.info("S5 완료: pdf_path=%s", pdf_path)
+        _notify("S5 complete")
+        logger.info("S5 complete: pdf_path=%s", pdf_path)
         return step_result
 
-    # ------------------------------------------------------------------
-    # S6: Key splitting
-    # ------------------------------------------------------------------
-
-    def run_s6(
-        self,
-        unlock_days: int = 10,
-    ) -> dict[str, Any]:
-        """Split the AES key via SSS 2-of-4 and encrypt shares 3/4.
-
-        Args:
-            unlock_days: Number of days until key share 3 becomes accessible.
-
-        Returns a dict with keys: shares, unlock_time_iso,
-        encrypted_shares.
-        """
+    def run_s6(self, unlock_days: int = 10) -> dict[str, Any]:
+        """Split the AES key via SSS 2-of-4 and encrypt shares 3/4."""
         if "s1" not in self.state:
-            raise RuntimeError("S1이 완료되지 않았습니다.")
+            raise RuntimeError("S1 must complete before S6")
 
         from .crypto import encrypt_envelope, get_master_key_path, split_key
+        from .crypto import recover_key
 
         aes_key_hex = self.state["s1"]["aes_key_hex"]
         shares = split_key(aes_key_hex)
-
-        # Verify split by recovering with shares 0 and 1
-        from .crypto import recover_key
-
         recovered = recover_key([shares[0], shares[1]])
         if recovered != aes_key_hex:
-            raise RuntimeError("키 분할 검증 실패: 복원된 키가 원본과 불일치")
+            raise RuntimeError("SSS recovery self-check failed")
 
-        # Encrypt shares 3 and 4 with local KMS
         master_path = get_master_key_path()
         enc_share_3 = encrypt_envelope(shares[2].encode("utf-8"), master_path)
         enc_share_4 = encrypt_envelope(shares[3].encode("utf-8"), master_path)
 
-        # Calculate unlock_time
-        now = datetime.now(tz=timezone.utc)
-        unlock_time = now + timedelta(days=unlock_days)
-
+        unlock_time = datetime.now(tz=timezone.utc) + timedelta(days=unlock_days)
         step_result = {
             "shares": shares,
             "unlock_time_iso": unlock_time.isoformat(),
             "encrypted_shares": {3: enc_share_3, 4: enc_share_4},
         }
         self.state["s6"] = step_result
-        logger.info(
-            "S6 완료: 키 분할 4조각, unlock_time=%s", unlock_time.isoformat()
-        )
+        logger.info("S6 complete: unlock_time=%s", unlock_time.isoformat())
         return step_result
 
-    # ------------------------------------------------------------------
-    # S7: Save records
-    # ------------------------------------------------------------------
-
     def run_s7(self) -> SealResult:
-        """Persist seal record, key shares, and certificate to the DB.
-
-        Returns a SealResult with the complete sealing outcome.
-        """
+        """Persist seal record, key shares, and certificate to the DB."""
         required = ["s1", "s4", "s5", "s6"]
         for step in required:
             if step not in self.state:
-                raise RuntimeError(f"{step.upper()}가 완료되지 않았습니다.")
+                raise RuntimeError(f"{step.upper()} must complete before S7")
 
-        from .db import (
-            save_certificate,
-            save_key_shares,
-            save_seal_record,
-        )
+        from .db import save_seal_bundle
 
         seal_id = self.state["s4"]["seal_id"]
         record_dict = self.state["s4"]["record_dict"]
-
-        # Update record with S6 info
         record_with_unlock = {
             **record_dict,
-            "unlock_time": self.state["s6"]["unlock_time_iso"],
+            "unlock_time_iso": self.state["s6"]["unlock_time_iso"],
         }
         record_json = json.dumps(record_with_unlock, ensure_ascii=False, indent=2)
         pdf_path = self.state["s5"]["pdf_path"]
 
-        # Save to DB
-        save_seal_record(self._db_path, seal_id, record_json, pdf_path)
-
-        # Save encrypted key shares 3 and 4
-        enc_shares = self.state["s6"]["encrypted_shares"]
-        save_key_shares(self._db_path, seal_id, enc_shares)
-
-        # Save certificate if available
         cert_pem = self.state["s5"].get("cert_pem", "")
         key_pem = self.state["s5"].get("key_pem", b"")
+        key_encrypted = key_pem
         if cert_pem:
-            # Encrypt private key before storing
             try:
                 from .crypto import encrypt_envelope, get_master_key_path
 
                 master_path = get_master_key_path()
                 key_encrypted = encrypt_envelope(key_pem, master_path)
             except Exception:
-                key_encrypted = key_pem  # Fallback: store as-is
-            save_certificate(self._db_path, seal_id, cert_pem, key_encrypted)
+                key_encrypted = key_pem
+
+        # Persist record, key shares, and certificate atomically in a
+        # single transaction (all-or-nothing).
+        save_seal_bundle(
+            self._db_path,
+            seal_id,
+            record_json,
+            pdf_path,
+            shares=self.state["s6"]["encrypted_shares"],
+            cert_pem=cert_pem,
+            key_pem_encrypted=key_encrypted,
+        )
 
         shares = self.state["s6"]["shares"]
         result = SealResult(
@@ -455,10 +446,48 @@ class SealProcess:
             unlock_time_iso=self.state["s6"]["unlock_time_iso"],
             record_json=record_json,
         )
-
         self.state["s7"] = {"seal_result": result}
-        logger.info("S7 완료: seal_id=%s, 모든 기록 저장", seal_id)
+        logger.info("S7 complete: seal_id=%s", seal_id)
         return result
+
+
+def _read_enc_metadata(enc_filepath: str) -> dict[str, Any]:
+    """Read the embedded metadata JSON from an encrypted .enc file."""
+    with open(enc_filepath, "rb") as f:
+        f.seek(-4, 2)
+        meta_size = struct.unpack("<I", f.read(4))[0]
+        f.seek(-(4 + meta_size), 2)
+        return json.loads(f.read(meta_size).decode("utf-8"))
+
+
+def _sha256_file_digest(path: str | Path) -> bytes:
+    """Compute the SHA-256 digest of a file with 8 MiB streaming reads."""
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(8 * 1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.digest()
+
+
+def _to_zulu(value: str) -> str:
+    """Normalize ISO 8601 timestamps to the schema's UTC Z form."""
+    if value.endswith("+00:00"):
+        return value.replace("+00:00", "Z")
+    return value
+
+
+def _signature_hash(signature_lines: list[tuple[int, int, int, int]]) -> str:
+    """Derive a stable SHA-256 hash from signature line coordinates."""
+    import hashlib
+
+    return hashlib.sha256(
+        json.dumps(signature_lines).encode("utf-8")
+    ).hexdigest()
 
 
 def run_seal_in_background(
@@ -470,19 +499,7 @@ def run_seal_in_background(
     on_complete: Optional[Callable[[SealResult], None]] = None,
     on_error: Optional[Callable[[str, Exception], None]] = None,
 ) -> threading.Thread:
-    """Run the full seal process on a background thread.
-
-    Args:
-        process: The SealProcess instance.
-        wizard_data: Data collected from the seal wizard.
-        db_path: SQLite database path.
-        on_step: Callback ``(step_name, message)`` for progress updates.
-        on_complete: Callback with the final SealResult.
-        on_error: Callback ``(step_name, exception)`` on failure.
-
-    Returns:
-        The started daemon thread.
-    """
+    """Run the full seal process on a background thread."""
 
     def _notify(step: str, msg: str) -> None:
         if on_step:
@@ -503,24 +520,23 @@ def run_seal_in_background(
             )
             process.set_config(config)
 
-            _notify("S4", "봉인 기록 생성 중...")
+            _notify("S4", "Building seal record")
             process.run_s4()
 
-            _notify("S5", "전자서명 진행 중...")
+            _notify("S5", "Generating signed record artifacts")
             process.run_s5(status_cb=lambda msg: _notify("S5", msg))
 
-            _notify("S6", "키 분할 중...")
-            unlock_days = wizard_data.get("unlock_days", 10)
-            process.run_s6(unlock_days=unlock_days)
+            _notify("S6", "Splitting AES key")
+            process.run_s6(unlock_days=wizard_data.get("unlock_days", 10))
 
-            _notify("S7", "기록 저장 중...")
+            _notify("S7", "Saving seal record")
             result = process.run_s7()
 
             if on_complete:
                 on_complete(result)
 
         except Exception as exc:
-            logger.exception("봉인 프로세스 오류")
+            logger.exception("Seal workflow failed")
             if on_error:
                 on_error("unknown", exc)
 

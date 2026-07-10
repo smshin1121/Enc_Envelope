@@ -29,6 +29,8 @@ try:
         _build_tst_info,
         _process_tsq,
         create_tsa_server,
+        ensure_tsa_credentials,
+        ensure_tsa_server_running,
         run_tsa_server,
         start_tsa_server_background,
     )
@@ -74,6 +76,13 @@ class TestFunctionSignatures:
         params = list(sig.parameters.keys())
         assert "tsa_key_path" in params
         assert "tsa_cert_path" in params
+
+    def test_ensure_tsa_server_running_params(self) -> None:
+        sig = inspect.signature(ensure_tsa_server_running)
+        params = list(sig.parameters.keys())
+        assert "tsa_dir" in params
+        assert "host" in params
+        assert "port" in params
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +239,73 @@ class TestTSAServerIntegration:
 
         finally:
             server.shutdown()
+
+    def test_server_echoes_nonce(self, tsa_credentials):
+        """RFC3161 responses should preserve the request nonce."""
+        from asn1crypto import algos, cms, tsp
+        import requests
+
+        key_path, cert_path = tsa_credentials
+        port = 13165
+        server, thread = start_tsa_server_background(
+            tsa_key_path=key_path,
+            tsa_cert_path=cert_path,
+            host="127.0.0.1",
+            port=port,
+        )
+
+        try:
+            time.sleep(0.3)
+
+            nonce = 987654321
+            tsq = tsp.TimeStampReq({
+                "version": "v1",
+                "message_imprint": tsp.MessageImprint({
+                    "hash_algorithm": algos.DigestAlgorithm({
+                        "algorithm": "sha256",
+                    }),
+                    "hashed_message": hashlib.sha256(b"nonce-test").digest(),
+                }),
+                "nonce": nonce,
+                "cert_req": True,
+            })
+            response = requests.post(
+                f"http://127.0.0.1:{port}/tsa",
+                data=tsq.dump(),
+                headers={"Content-Type": "application/timestamp-query"},
+                timeout=10,
+            )
+            response.raise_for_status()
+
+            tsr = tsp.TimeStampResp.load(response.content)
+            token = cms.ContentInfo.load(tsr["time_stamp_token"].dump())
+            signed_data = token["content"]
+            tst_info = tsp.TSTInfo.load(
+                signed_data["encap_content_info"]["content"].parsed.dump()
+            )
+            assert tst_info["nonce"].native == nonce
+        finally:
+            server.shutdown()
+
+    def test_ensure_tsa_credentials_creates_files(self, tmp_path):
+        key_path, cert_path = ensure_tsa_credentials(tmp_path / "tsa-auto")
+        assert key_path.is_file()
+        assert cert_path.is_file()
+
+    def test_ensure_tsa_server_running_bootstraps(self, tmp_path):
+        tsa_url, cert_path = ensure_tsa_server_running(
+            tsa_dir=tmp_path / "tsa-auto",
+            host="127.0.0.1",
+            port=13163,
+        )
+
+        assert tsa_url == "http://127.0.0.1:13163/tsa"
+        assert cert_path.is_file()
+
+        data_hash = hashlib.sha256(b"bootstrap").digest()
+        tst_token = request_timestamp(data_hash, tsa_url)
+        gen_time = verify_timestamp(tst_token, str(cert_path))
+        assert gen_time.tzinfo is not None
 
 
 # ---------------------------------------------------------------------------

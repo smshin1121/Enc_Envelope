@@ -227,7 +227,7 @@ class ResealProcess:
         if "r2" not in self.state:
             raise RuntimeError("R2가 완료되지 않았습니다.")
 
-        from .crypto import collect_metadata, encrypt_file
+        from .crypto import MAX_CHUNK_SIZE, encrypt_file
 
         # Determine which files to encrypt
         # For simplicity, encrypt the source directory as a unit
@@ -235,9 +235,15 @@ class ResealProcess:
         source_dir = self.state["r2"]["target_dir"]
         output_dir = self.config.output_dir
 
-        # Generate new AES key
-        aes_key = os.urandom(32)
-        aes_key_hex = aes_key.hex()
+        # AES 키: 같은 세션 재시도(취소/오류 후 재실행) 시 기존 키를
+        # 재사용한다. 새 키를 만들면 .enc.progress 기반 resume이 이전 키
+        # 청크에 새 키 청크를 이어붙여 영구 복호화 불가가 되기 때문
+        # (crypto 계층의 키 지문 가드와 2중 방어).
+        aes_key_hex = self.state.get("r5_aes_key_hex")
+        if aes_key_hex is None:
+            aes_key_hex = os.urandom(32).hex()
+            self.state["r5_aes_key_hex"] = aes_key_hex
+        aes_key = bytes.fromhex(aes_key_hex)
 
         # Find the primary file to encrypt
         # Use the first known file or the directory itself
@@ -257,12 +263,18 @@ class ResealProcess:
 
         enc_results: list[dict[str, Any]] = []
         total_files = len(files_to_encrypt)
+        chunk_bytes = min(self.config.chunk_size_bytes, MAX_CHUNK_SIZE)
+
+        # 취소/중단 후 위자드가 완료 없이 destroy될 때 부분 산출물을
+        # 정리할 수 있도록 생성 예정 경로를 미리 기록한다.
+        pending_paths: list[str] = []
+        self.state["r5_pending_enc_paths"] = pending_paths
 
         for idx, filepath in enumerate(files_to_encrypt):
-            metadata = collect_metadata(filepath)
             src_name = Path(filepath).stem
             enc_filename = f"{src_name}.enc"
             enc_path = str(Path(output_dir) / enc_filename)
+            pending_paths.append(enc_path)
 
             def _wrapped_cb(current: int, total: int) -> None:
                 if progress_cb:
@@ -271,13 +283,16 @@ class ResealProcess:
                     overall_total = total_files * 100
                     progress_cb(overall, overall_total)
 
+            # MD5/SHA-256 metadata is computed inline during the
+            # encryption read (single pass over the source file).
             result = encrypt_file(
                 filepath=filepath,
                 aes_key=aes_key,
                 output_path=enc_path,
-                chunk_size=self.config.chunk_size_bytes,
+                chunk_size=chunk_bytes,
                 progress_cb=_wrapped_cb,
             )
+            metadata = result.metadata
 
             enc_results.append(
                 {
@@ -322,7 +337,7 @@ class ResealProcess:
         record_dict: dict[str, Any] = {}
 
         try:
-            from .record import build_reseal_record
+            from .record import append_event, build_reseal_record
 
             process_info = {
                 "type": "Resealing",
@@ -333,16 +348,37 @@ class ResealProcess:
                 "end_time": now.isoformat(),
             }
             file_info = {
+                # Files sealed by this reseal (known + derived) — the next
+                # unseal/reseal cross-checks hashes against this list.
+                "original_files": [
+                    er.get("metadata", {})
+                    for er in self.state["r5"]["enc_results"]
+                ],
                 "enc_results": self.state["r5"]["enc_results"],
                 "encryption_algo": self.state["r5"]["encryption_algo"],
             }
+
+            # build_reseal_record inherits history as-is — append the
+            # reseal event first so summary becomes e.g. S1U1R1.
+            prev_for_build = prev_record
+            try:
+                prev_history = prev_record.get("history") or {}
+                new_history = append_event(prev_history, {
+                    "seal_type": "Resealing",
+                    "start_time": now.isoformat(),
+                    "end_time": now.isoformat(),
+                    "investigator": self.config.investigator,
+                })
+                prev_for_build = {**prev_record, "history": new_history}
+            except Exception as exc:
+                logger.warning("history 이벤트 추가 실패 (이전 이력 유지): %s", exc)
             unknown_files = self.state.get("r3", {}).get(
                 "classifications", []
             )
             derived_files = self.state.get("r3", {}).get("derived_files", [])
 
             record_dict = build_reseal_record(
-                prev_record=prev_record,
+                prev_record=prev_for_build,
                 process_info=process_info,
                 file_info=file_info,
                 unknown_files=[
@@ -487,23 +523,27 @@ class ResealProcess:
             if step not in self.state:
                 raise RuntimeError(f"{step.upper()}가 완료되지 않았습니다.")
 
-        from .db import save_key_shares, save_seal_record
+        from .db import save_seal_bundle
 
         seal_id = self.state["r1"]["seal_id"]
         record_dict = self.state["r6"]["record_dict"]
         record_with_unlock = {
             **record_dict,
-            "unlock_time": self.state["r7"]["unlock_time_iso"],
+            "unlock_time_iso": self.state["r7"]["unlock_time_iso"],
         }
         record_json = json.dumps(
             record_with_unlock, ensure_ascii=False, indent=2
         )
         pdf_path = self.state["r6"]["pdf_path"]
 
-        save_seal_record(self._db_path, seal_id, record_json, pdf_path)
-
-        enc_shares = self.state["r7"]["encrypted_shares"]
-        save_key_shares(self._db_path, seal_id, enc_shares)
+        # Persist record and key shares atomically in one transaction.
+        save_seal_bundle(
+            self._db_path,
+            seal_id,
+            record_json,
+            pdf_path,
+            shares=self.state["r7"]["encrypted_shares"],
+        )
 
         shares = self.state["r7"]["shares"]
         enc_results = self.state["r5"].get("enc_results", [])
@@ -536,24 +576,67 @@ def _compute_summary(history: list[dict[str, Any]]) -> str:
     return f"S{seal_count}U{unseal_count}R{reseal_count}"
 
 
+def _sha256_of_file(filepath: Path) -> str:
+    """Compute the SHA-256 hex digest of a file with 8 MiB reads."""
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        while True:
+            chunk = f.read(8 * 1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _suggest_category(filepath: Path, size: int) -> str:
+    """Suggest a fallback classification category for an unknown file."""
+    ext = filepath.suffix.lower()
+    if ext in (".log", ".txt"):
+        return "analysis_log"
+    if ext in (".pdf", ".docx", ".xlsx"):
+        return "report"
+    if size < 1024:
+        return "small_artifact"
+    if size > 100 * 1024 * 1024:
+        return "large_artifact"
+    return "uncategorized"
+
+
 def _fallback_classify(
     prev_record: dict[str, Any],
     target_dir: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Simple fallback file classification when record module is unavailable."""
-    import hashlib
+    """Simple fallback file classification when record module is unavailable.
 
-    # Build known hash set from previous record
+    A hash can only match a known file when the sizes match, so files
+    whose size matches no known file are classified unknown without
+    hashing (size pre-filter). Size-matching candidates are hashed in
+    parallel (hashlib releases the GIL for large buffers).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    # Build known hash / size sets from the previous record
     known_hashes: set[str] = set()
-    original_file = prev_record.get("original_file", {})
-    if original_file.get("sha256"):
-        known_hashes.add(original_file["sha256"])
+    known_sizes: set[int] = set()
+    sizes_complete = True
 
-    # Also check file_info if present
+    def _register_known(entry: dict[str, Any]) -> None:
+        nonlocal sizes_complete
+        if entry.get("sha256"):
+            known_hashes.add(entry["sha256"])
+            if isinstance(entry.get("size"), int):
+                known_sizes.add(entry["size"])
+            else:
+                # Legacy record without size: the pre-filter would
+                # misclassify, so fall back to hashing every file.
+                sizes_complete = False
+
+    _register_known(prev_record.get("original_file", {}))
     file_info = prev_record.get("file_info", {})
     for f in file_info.get("original_files", []):
-        if f.get("sha256"):
-            known_hashes.add(f["sha256"])
+        _register_known(f)
 
     known_files: list[dict[str, Any]] = []
     unknown_files: list[dict[str, Any]] = []
@@ -562,42 +645,42 @@ def _fallback_classify(
     if not target.exists():
         return known_files, unknown_files
 
-    for filepath in target.rglob("*"):
-        if not filepath.is_file():
-            continue
+    # Single stat per file, cached alongside the path
+    candidates: list[tuple[Path, int]] = [
+        (fp, fp.stat().st_size)
+        for fp in sorted(target.rglob("*"))
+        if fp.is_file()
+    ]
 
-        h = hashlib.sha256()
-        with open(filepath, "rb") as f:
-            while True:
-                chunk = f.read(8 * 1024 * 1024)
-                if not chunk:
-                    break
-                h.update(chunk)
-        file_hash = h.hexdigest()
+    # Size pre-filter: only size-matching files can be known -> hash them
+    if sizes_complete:
+        to_hash = [
+            (fp, size) for fp, size in candidates if size in known_sizes
+        ]
+    else:
+        to_hash = candidates
 
+    hashes: dict[Path, str] = {}
+    if to_hash:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            digests = pool.map(_sha256_of_file, (fp for fp, _ in to_hash))
+            hashes = {fp: digest for (fp, _), digest in zip(to_hash, digests)}
+
+    for filepath, size in candidates:
+        file_hash = hashes.get(filepath, "")
         file_entry = {
             "filepath": str(filepath),
             "filename": filepath.name,
-            "size": filepath.stat().st_size,
+            "size": size,
             "sha256": file_hash,
         }
 
-        if file_hash in known_hashes:
+        if file_hash and file_hash in known_hashes:
             known_files.append(file_entry)
         else:
-            # Add suggested category
-            ext = filepath.suffix.lower()
-            category = "uncategorized"
-            if ext in (".log", ".txt"):
-                category = "analysis_log"
-            elif ext in (".pdf", ".docx", ".xlsx"):
-                category = "report"
-            elif filepath.stat().st_size < 1024:
-                category = "small_artifact"
-            elif filepath.stat().st_size > 100 * 1024 * 1024:
-                category = "large_artifact"
-
-            file_entry["suggested_category"] = category
+            file_entry["suggested_category"] = _suggest_category(
+                filepath, size
+            )
             unknown_files.append(file_entry)
 
     return known_files, unknown_files

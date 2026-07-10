@@ -37,6 +37,44 @@ _VALID_TEMPLATES = frozenset({
 })
 
 # ---------------------------------------------------------------------------
+# Cached backends (initialized once per process)
+# ---------------------------------------------------------------------------
+
+_JINJA_ENV: Environment | None = None
+_WEASYPRINT_MODULE: object | None = None
+_WEASYPRINT_CHECKED: bool = False
+
+
+def _get_jinja_env() -> Environment:
+    """Return the module-level Jinja2 environment (created once)."""
+    global _JINJA_ENV
+    if _JINJA_ENV is None:
+        _JINJA_ENV = Environment(
+            loader=FileSystemLoader(str(_TEMPLATES_DIR)),
+            autoescape=True,
+        )
+    return _JINJA_ENV
+
+
+def _get_weasyprint() -> object | None:
+    """Return the weasyprint module or None if unavailable (cached).
+
+    The import (and its system-library probing) runs only once per
+    process; later renders reuse the cached result.
+    """
+    global _WEASYPRINT_MODULE, _WEASYPRINT_CHECKED
+    if not _WEASYPRINT_CHECKED:
+        try:
+            import weasyprint
+
+            _WEASYPRINT_MODULE = weasyprint
+        except (ImportError, OSError) as exc:
+            logger.info("weasyprint unavailable (%s), using ReportLab", exc)
+            _WEASYPRINT_MODULE = None
+        _WEASYPRINT_CHECKED = True
+    return _WEASYPRINT_MODULE
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -69,7 +107,13 @@ def render_record_pdf(
             f"Valid templates: {sorted(_VALID_TEMPLATES)}"
         )
 
-    html_content = _render_html(record, template_name)
+    # When weasyprint is known to be unavailable the ReportLab backend
+    # is used directly and the intermediate HTML render is skipped.
+    if _get_weasyprint() is None:
+        html_content = None
+    else:
+        html_content = _render_html(record, template_name)
+
     pdf_path = _convert_html_to_pdf(
         html_content, output_path,
         record_dict=record, template_name=template_name,
@@ -86,10 +130,7 @@ def render_record_pdf(
 def _render_html(record: dict, template_name: str) -> str:
     """Render a record dict to an HTML string via Jinja2."""
     try:
-        env = Environment(
-            loader=FileSystemLoader(str(_TEMPLATES_DIR)),
-            autoescape=True,
-        )
+        env = _get_jinja_env()
         template = env.get_template(template_name)
     except TemplateNotFound as exc:
         raise RenderingError(
@@ -123,7 +164,7 @@ def _resolve_generator(template_name: str):
 
 
 def _convert_html_to_pdf(
-    html_content: str,
+    html_content: str | None,
     output_path: str,
     record_dict: dict | None = None,
     template_name: str = "seal_record.html",
@@ -131,7 +172,8 @@ def _convert_html_to_pdf(
     """Convert an HTML string to a PDF file.
 
     Tries weasyprint first (best quality), falls back to the appropriate
-    ReportLab Platypus generator based on template_name.
+    ReportLab Platypus generator based on template_name. When
+    ``html_content`` is None the weasyprint path is skipped entirely.
     """
     abs_path = os.path.abspath(output_path)
     output_dir = os.path.dirname(abs_path)
@@ -144,17 +186,18 @@ def _convert_html_to_pdf(
             ) from exc
 
     # Try weasyprint first (best quality)
-    try:
-        import weasyprint
-        html_doc = weasyprint.HTML(
-            string=html_content,
-            base_url=str(_TEMPLATES_DIR),
-        )
-        html_doc.write_pdf(abs_path)
-        logger.info("PDF generated with weasyprint")
-        return abs_path
-    except (ImportError, OSError) as exc:
-        logger.info("weasyprint unavailable (%s), trying ReportLab", exc)
+    weasyprint = _get_weasyprint()
+    if weasyprint is not None and html_content is not None:
+        try:
+            html_doc = weasyprint.HTML(
+                string=html_content,
+                base_url=str(_TEMPLATES_DIR),
+            )
+            html_doc.write_pdf(abs_path)
+            logger.info("PDF generated with weasyprint")
+            return abs_path
+        except OSError as exc:
+            logger.info("weasyprint failed (%s), trying ReportLab", exc)
 
     # Fallback: ReportLab Platypus direct PDF generation
     if record_dict is None:

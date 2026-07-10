@@ -167,7 +167,7 @@ class TestCiphertextTooShort:
 # ---------------------------------------------------------------------------
 
 class TestGetMasterKeyPath:
-    """get_master_key_path reads from MASTER_KEY_PATH env var."""
+    """get_master_key_path prefers env var and falls back to default path."""
 
     def test_env_var_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("MASTER_KEY_PATH", "/some/path/master.key")
@@ -175,10 +175,31 @@ class TestGetMasterKeyPath:
 
     def test_env_var_not_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("MASTER_KEY_PATH", raising=False)
+        monkeypatch.setattr(
+            "desktop.crypto.local_kms._DEFAULT_MASTER_KEY_PATH",
+            Path("/nonexistent/master.key"),
+        )
         with pytest.raises(KMSError):
             get_master_key_path()
 
     def test_env_var_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("MASTER_KEY_PATH", "")
+        monkeypatch.setattr(
+            "desktop.crypto.local_kms._DEFAULT_MASTER_KEY_PATH",
+            Path("/nonexistent/master.key"),
+        )
         with pytest.raises(KMSError):
             get_master_key_path()
+
+    def test_default_path_used_when_present(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        monkeypatch.delenv("MASTER_KEY_PATH", raising=False)
+        monkeypatch.setattr(
+            "desktop.crypto.local_kms._DEFAULT_MASTER_KEY_PATH",
+            tmp_path / "master.key",
+        )
+        init_master_key(str(tmp_path / "master.key"))
+        assert get_master_key_path() == str(tmp_path / "master.key")

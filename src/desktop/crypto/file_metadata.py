@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from .exceptions import MetadataError
 from .types import FileMetadata
 
-_HASH_CHUNK_SIZE = 8 * 1024  # 8KB streaming chunks
+_HASH_CHUNK_SIZE = 8 * 1024 * 1024  # 8 MiB streaming chunks
 
 
 def collect_metadata(filepath: str) -> FileMetadata:

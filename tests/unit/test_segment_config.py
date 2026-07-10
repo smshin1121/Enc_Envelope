@@ -1,7 +1,7 @@
 """Tests for segment (chunk) size configuration.
 
 Validates:
-- Default chunk_size is 64 GB at parameter level
+- Default chunk_size is 64 GiB - 16 MiB (GCM plaintext limit margin)
 - Minimum chunk_size (1 GB) works correctly
 - Sub-minimum chunk_size raises EncryptionError
 - Super-maximum chunk_size raises EncryptionError
@@ -25,6 +25,11 @@ from tests.fixtures.generate_test_files import SIZE_1MB, create_random_file
 
 _1GB = 1 * 1024**3
 _64GB = 64 * 1024**3
+_16MB = 16 * 1024**2
+# GCM authenticates at most 2^39 - 256 bits (64 GiB - 32 B) of plaintext
+# per (key, nonce); the max chunk keeps a 16 MiB margin below that.
+_GCM_PLAINTEXT_LIMIT = _64GB - 32
+_EXPECTED_MAX = _64GB - _16MB
 
 
 # ---------------------------------------------------------------------------
@@ -32,21 +37,25 @@ _64GB = 64 * 1024**3
 # ---------------------------------------------------------------------------
 
 class TestDefaultChunkSize:
-    """The default chunk_size parameter must be 64 GB."""
+    """The default chunk_size must be 64 GiB - 16 MiB (GCM margin)."""
 
-    def test_default_constant_is_64gb(self) -> None:
-        assert _DEFAULT_CHUNK_SIZE == _64GB
+    def test_default_constant_is_64gb_minus_margin(self) -> None:
+        assert _DEFAULT_CHUNK_SIZE == _EXPECTED_MAX
+
+    def test_default_below_gcm_plaintext_limit(self) -> None:
+        assert _DEFAULT_CHUNK_SIZE < _GCM_PLAINTEXT_LIMIT
 
     def test_function_signature_default(self) -> None:
         sig = inspect.signature(encrypt_file)
         default = sig.parameters["chunk_size"].default
-        assert default == _64GB
+        assert default == _EXPECTED_MAX
 
     def test_min_constant_is_1gb(self) -> None:
         assert _MIN_CHUNK_SIZE == _1GB
 
-    def test_max_constant_is_64gb(self) -> None:
-        assert _MAX_CHUNK_SIZE == _64GB
+    def test_max_constant_is_64gb_minus_margin(self) -> None:
+        assert _MAX_CHUNK_SIZE == _EXPECTED_MAX
+        assert _MAX_CHUNK_SIZE < _GCM_PLAINTEXT_LIMIT
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +129,18 @@ class TestBelowMinChunkSize:
 # ---------------------------------------------------------------------------
 
 class TestAboveMaxChunkSize:
-    """chunk_size above 64 GB must be rejected."""
+    """chunk_size above 64 GiB - 16 MiB must be rejected."""
+
+    def test_full_64gb_raises_error(
+        self, file_1mb: str, aes_key: bytes, tmp_work_dir: Path
+    ) -> None:
+        """A full 64 GiB chunk exceeds the GCM plaintext limit."""
+        enc_path = str(tmp_work_dir / "full_64gb.enc")
+        with pytest.raises(EncryptionError):
+            encrypt_file(
+                file_1mb, aes_key, enc_path,
+                chunk_size=64 * 1024**3,
+            )
 
     def test_65gb_raises_error(
         self, file_1mb: str, aes_key: bytes, tmp_work_dir: Path

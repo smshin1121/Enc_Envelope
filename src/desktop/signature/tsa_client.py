@@ -21,6 +21,23 @@ _TIMEOUT_SECONDS = 10
 _MAX_RETRIES = 3
 _RETRY_BACKOFF_BASE = 1.0  # seconds
 
+# A TSA on the loopback interface either answers immediately or is
+# down — long timeouts and extra retries only delay the fallback.
+_LOCAL_TIMEOUT_SECONDS = 2
+_LOCAL_MAX_RETRIES = 2
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _is_local_tsa(tsa_url: str) -> bool:
+    """Return True if the TSA URL points at the loopback interface."""
+    from urllib.parse import urlparse
+
+    try:
+        host = urlparse(tsa_url).hostname or ""
+    except ValueError:
+        return False
+    return host.lower() in _LOCAL_HOSTS
+
 
 def _build_tsq(data_hash: bytes) -> bytes:
     """Build an RFC 3161 TimeStampReq (TSQ) for a SHA-256 hash.
@@ -91,7 +108,9 @@ def _parse_tsr(tsr_bytes: bytes) -> bytes:
 def request_timestamp(data_hash: bytes, tsa_url: str) -> bytes:
     """Send an RFC 3161 TSQ to a TSA and return the TST token.
 
-    Retries up to 3 times with exponential backoff on network errors.
+    Retries with exponential backoff on network errors. Loopback TSA
+    URLs use a shorter timeout (2s) and fewer retries (2) since a
+    local server either responds immediately or is not running.
 
     Args:
         data_hash: SHA-256 hash (32 bytes) of the data to timestamp.
@@ -106,20 +125,27 @@ def request_timestamp(data_hash: bytes, tsa_url: str) -> bytes:
     if not tsa_url:
         raise TSAError("TSA URL is required")
 
+    if _is_local_tsa(tsa_url):
+        timeout_seconds = _LOCAL_TIMEOUT_SECONDS
+        max_retries = _LOCAL_MAX_RETRIES
+    else:
+        timeout_seconds = _TIMEOUT_SECONDS
+        max_retries = _MAX_RETRIES
+
     tsq_bytes = _build_tsq(data_hash)
     last_error: Exception | None = None
 
-    for attempt in range(1, _MAX_RETRIES + 1):
+    for attempt in range(1, max_retries + 1):
         try:
             logger.info(
                 "TSA request attempt %d/%d to %s",
-                attempt, _MAX_RETRIES, tsa_url,
+                attempt, max_retries, tsa_url,
             )
             response = requests.post(
                 tsa_url,
                 data=tsq_bytes,
                 headers={"Content-Type": "application/timestamp-query"},
-                timeout=_TIMEOUT_SECONDS,
+                timeout=timeout_seconds,
             )
             response.raise_for_status()
 
@@ -137,7 +163,7 @@ def request_timestamp(data_hash: bytes, tsa_url: str) -> bytes:
             raise
         except Exception as exc:
             last_error = exc
-            if attempt < _MAX_RETRIES:
+            if attempt < max_retries:
                 wait_time = _RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
                 logger.warning(
                     "TSA request attempt %d failed: %s. Retrying in %.1fs...",
@@ -146,11 +172,11 @@ def request_timestamp(data_hash: bytes, tsa_url: str) -> bytes:
                 time.sleep(wait_time)
             else:
                 logger.error(
-                    "TSA request failed after %d attempts", _MAX_RETRIES
+                    "TSA request failed after %d attempts", max_retries
                 )
 
     raise TSAError(
-        f"TSA request failed after {_MAX_RETRIES} attempts: {last_error}"
+        f"TSA request failed after {max_retries} attempts: {last_error}"
     )
 
 

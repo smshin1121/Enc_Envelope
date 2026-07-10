@@ -167,6 +167,10 @@ def _build_file_entry(
             "size": stat.st_size,
             "sha256": sha256,
             "path": rel_path,
+            # Absolute path — consumed by ResealProcess.run_r5_encrypt and
+            # the reseal wizard R3 classification (same shape as the
+            # _fallback_classify entries in reseal_process).
+            "filepath": os.path.abspath(filepath),
         }
     except OSError as exc:
         logger.warning("Cannot read file '%s': %s", filepath, exc)

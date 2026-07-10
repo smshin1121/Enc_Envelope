@@ -175,21 +175,39 @@ class UnsealProcess:
 
         items: list[VerificationItem] = []
 
-        # Extract expected info from seal record
-        original_file = seal_record.get("original_file", {})
+        # Extract expected info from seal record. The canonical record
+        # schema (build_seal_record) nests these under
+        # file_info.original_files / file_info.result_files; fall back to
+        # the legacy flat keys for older records.
+        file_info = seal_record.get("file_info", {})
+        original_files = file_info.get("original_files") or []
+        original_file = (
+            original_files[0]
+            if original_files
+            else seal_record.get("original_file", {})
+        )
         encryption_info = seal_record.get("encryption", {})
 
         expected_filename = original_file.get("filename", "")
         expected_size = original_file.get("size", 0)
         expected_sha256 = original_file.get("sha256", "")
 
-        # Get actual .enc file info
+        # Get actual .enc file info. The seal record stores no hash for
+        # the .enc container itself, so computing its SHA-256 here would
+        # be a full read with nothing to compare against — skip it and
+        # keep the filename-based cross check.
         enc_path = Path(enc_filepath)
         actual_size = enc_path.stat().st_size
-        actual_sha256 = _compute_sha256(enc_filepath)
+        actual_sha256 = ""
 
-        # Check enc_filepath recorded in seal record
-        recorded_enc = encryption_info.get("enc_filepath", "")
+        # Check enc filename recorded in seal record (canonical schema:
+        # file_info.result_files[0].filename; legacy: encryption.enc_filepath)
+        result_files = file_info.get("result_files") or []
+        recorded_enc = (
+            result_files[0].get("filename", "")
+            if result_files
+            else encryption_info.get("enc_filepath", "")
+        )
         recorded_enc_name = Path(recorded_enc).name if recorded_enc else ""
         actual_enc_name = enc_path.name
 
@@ -298,7 +316,7 @@ class UnsealProcess:
         # Build unseal record
         record_dict: dict[str, Any] = {}
         try:
-            from .record import build_unseal_record
+            from .record import append_event, build_unseal_record
 
             process_info = {
                 "type": "Unsealing",
@@ -309,14 +327,36 @@ class UnsealProcess:
                 "end_time": now.isoformat(),
             }
             file_info = {
+                # Carry the original file metadata forward so the next
+                # process (reseal R2 known-file matching, U4 verification)
+                # can cross-check hashes against this record.
+                "original_files": (
+                    seal_record.get("file_info", {}).get("original_files", [])
+                ),
                 "output_filepath": self.state["u5"]["output_filepath"],
                 "hash_verified": self.state["u5"]["hash_verified"],
                 "sha256_match": self.state["u5"]["sha256_match"],
                 "md5_match": self.state["u5"]["md5_match"],
                 "metadata": self.state["u5"]["metadata"],
             }
+
+            # build_unseal_record inherits history as-is — the caller must
+            # append the unseal event first so summary becomes e.g. S1U1R0.
+            prev_for_build = seal_record
+            try:
+                prev_history = seal_record.get("history") or {}
+                new_history = append_event(prev_history, {
+                    "seal_type": "Unsealing",
+                    "start_time": now.isoformat(),
+                    "end_time": now.isoformat(),
+                    "investigator": self.config.investigator,
+                })
+                prev_for_build = {**seal_record, "history": new_history}
+            except Exception as exc:
+                logger.warning("history 이벤트 추가 실패 (이전 이력 유지): %s", exc)
+
             record_dict = build_unseal_record(
-                prev_record=seal_record,
+                prev_record=prev_for_build,
                 process_info=process_info,
                 file_info=file_info,
             )

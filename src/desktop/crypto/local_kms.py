@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -11,6 +12,7 @@ from .exceptions import KMSError
 _NONCE_SIZE = 12
 _KEY_SIZE = 32
 _ENV_MASTER_KEY_PATH = "MASTER_KEY_PATH"
+_DEFAULT_MASTER_KEY_PATH = Path.home() / ".enc_envelope" / "master.key"
 
 
 def init_master_key(path: str) -> None:
@@ -93,20 +95,25 @@ def decrypt_envelope(ciphertext: bytes, master_key_path: str) -> bytes:
 
 
 def get_master_key_path() -> str:
-    """Get the master key path from the MASTER_KEY_PATH environment variable.
+    """Resolve the active master key path.
 
     Returns:
         The file path string.
 
     Raises:
-        KMSError: If the environment variable is not set.
+        KMSError: If no configured or default path is available.
     """
     path = os.environ.get(_ENV_MASTER_KEY_PATH)
-    if not path:
-        raise KMSError(
-            f"Environment variable {_ENV_MASTER_KEY_PATH} is not set"
-        )
-    return path
+    if path:
+        return path
+
+    if _DEFAULT_MASTER_KEY_PATH.is_file():
+        return str(_DEFAULT_MASTER_KEY_PATH)
+
+    raise KMSError(
+        "Master key path is unavailable: set MASTER_KEY_PATH or initialize "
+        f"the default key at {_DEFAULT_MASTER_KEY_PATH}"
+    )
 
 
 def _load_master_key(path: str) -> bytes:

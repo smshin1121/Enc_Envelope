@@ -33,6 +33,8 @@ from .tsa_client import (
 )
 from .tsa_server import (
     create_tsa_server,
+    ensure_tsa_credentials,
+    ensure_tsa_server_running,
     run_tsa_server,
     start_tsa_server_background,
 )
@@ -61,6 +63,8 @@ __all__ = [
     "verify_timestamp",
     # TSA server
     "create_tsa_server",
+    "ensure_tsa_credentials",
+    "ensure_tsa_server_running",
     "run_tsa_server",
     "start_tsa_server_background",
     # Types

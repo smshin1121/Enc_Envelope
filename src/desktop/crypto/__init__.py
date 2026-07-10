@@ -5,7 +5,12 @@ key management, and access control.
 """
 
 from .aes_gcm_decrypt import decrypt_file
-from .aes_gcm_encrypt import encrypt_file
+from .aes_gcm_encrypt import (
+    DEFAULT_CHUNK_SIZE,
+    MAX_CHUNK_SIZE,
+    MIN_CHUNK_SIZE,
+    encrypt_file,
+)
 from .exceptions import (
     AccessControlError,
     CryptoError,
@@ -38,6 +43,9 @@ __all__ = [
     # Encryption / Decryption
     "encrypt_file",
     "decrypt_file",
+    "MIN_CHUNK_SIZE",
+    "MAX_CHUNK_SIZE",
+    "DEFAULT_CHUNK_SIZE",
     # Metadata
     "collect_metadata",
     # SSS
