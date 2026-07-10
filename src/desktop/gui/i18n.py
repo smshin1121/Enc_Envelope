@@ -395,6 +395,25 @@ _TRANSLATIONS = {
     "case_detail.col_type": {"ko": "유형", "en": "Type"},
     "case_detail.col_size": {"ko": "크기", "en": "Size"},
     "case_detail.col_path": {"ko": "경로", "en": "Path"},
+    "case_detail.status_unknown": {"ko": "상태 정보 없음", "en": "Status Unknown"},
+    "case_detail.created_at": {"ko": "등록 일시", "en": "Registered At"},
+    "case_detail.section_original_files": {"ko": "원본 파일", "en": "Original Files"},
+    "case_detail.section_result_files": {
+        "ko": "암호화 결과 파일",
+        "en": "Encrypted Result Files",
+    },
+    "case_detail.section_unknown_files": {
+        "ko": "미분류 파일 (Unknown)",
+        "en": "Unknown Files",
+    },
+    "case_detail.section_derived_files": {"ko": "파생 파일", "en": "Derived Files"},
+    "case_detail.file_size": {"ko": "크기", "en": "Size"},
+    "case_detail.file_mtime": {"ko": "수정 시각", "en": "Modified"},
+    "case_detail.enc_algo": {"ko": "암호화 알고리즘", "en": "Encryption Algorithm"},
+    "case_detail.enc_ended": {"ko": "암호화 완료 시각", "en": "Encryption Finished"},
+    "case_detail.hash_match": {"ko": "해시 일치", "en": "Hash Match"},
+    "case_detail.hash_mismatch": {"ko": "해시 불일치", "en": "Hash Mismatch"},
+    "case_detail.no_files": {"ko": "파일 정보가 없습니다.", "en": "No file information."},
 
     # Artifact context menu
     "artifact.open": {"ko": "열기", "en": "Open"},
