@@ -472,8 +472,9 @@ class UnsealProcess:
         self, seal_id: str, record_json: str, pdf_path: str
     ) -> None:
         """Upload record to the remote participation system (optional)."""
-        # Placeholder for future web integration
-        logger.info("원격 업로드 미구현 (seal_id=%s)", seal_id)
+        from .sync import push_seal_record_safe
+
+        push_seal_record_safe(record_json, pdf_path)
 
 
 def _compute_summary(history: list[dict[str, Any]]) -> str:

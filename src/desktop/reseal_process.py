@@ -545,6 +545,15 @@ class ResealProcess:
             shares=self.state["r7"]["encrypted_shares"],
         )
 
+        # Optional: remote upload (research_site 연계 — unlock_time 은 수신측이
+        # 원장 MAX 로 적용하므로 재봉인 기록도 푸시한다. 미설정/실패 시 스킵.)
+        try:
+            from .sync import push_seal_record_safe
+
+            push_seal_record_safe(record_json, pdf_path)
+        except Exception as exc:
+            logger.warning("원격 업로드 실패 (스킵): %s", exc)
+
         shares = self.state["r7"]["shares"]
         enc_results = self.state["r5"].get("enc_results", [])
         enc_filepath = (

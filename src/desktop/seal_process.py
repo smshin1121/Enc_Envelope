@@ -437,6 +437,15 @@ class SealProcess:
             key_pem_encrypted=key_encrypted,
         )
 
+        # Optional: remote upload (research_site 연계 — 조각 업로드 전 봉인기록
+        # 선등록이 계약(§6)이므로 봉인 직후 푸시한다. 미설정/실패 시 스킵.)
+        try:
+            from .sync import push_seal_record_safe
+
+            push_seal_record_safe(record_json, pdf_path)
+        except Exception as exc:
+            logger.warning("원격 업로드 실패 (스킵): %s", exc)
+
         shares = self.state["s6"]["shares"]
         result = SealResult(
             seal_id=seal_id,
